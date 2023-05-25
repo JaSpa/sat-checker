@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.3.0", features = ["cargo", "derive", "wrap_help"] }
+color-eyre = "0.6.2"
+getrandom = "0.2.9"
+rand = { version = "0.8.5", features = ["small_rng"] }
