@@ -21,8 +21,16 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         craneLib = crane.lib.${system};
+
+        minisat-tests = craneLib.buildPackage {
+          src = craneLib.cleanCargoSource (craneLib.path ./.);
+        };
       in {
         formatter = pkgs.alejandra;
+
+        packages = {
+          inherit minisat-tests;
+        };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
