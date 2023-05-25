@@ -75,7 +75,7 @@
         "type": "github"
       }
     },
-    "minisat-patched-src": {
+    "minisat-mod-src": {
       "flake": false,
       "locked": {
         "lastModified": 1683826412,
@@ -109,7 +109,7 @@
       "inputs": {
         "crane": "crane",
         "flake-utils": "flake-utils_2",
-        "minisat-patched-src": "minisat-patched-src",
+        "minisat-mod-src": "minisat-mod-src",
         "nixpkgs": "nixpkgs"
       }
     },
