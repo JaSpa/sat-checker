@@ -75,6 +75,22 @@
         "type": "github"
       }
     },
+    "minisat-patched-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1683826412,
+        "narHash": "sha256-ffoarYTR1bUl72bVwHw1mCFXB/jPnAhLeKorhBhWnPw=",
+        "owner": "JaSpa",
+        "repo": "minisat",
+        "rev": "12362ab9203bfe156584a086e50edeca11cb5a50",
+        "type": "github"
+      },
+      "original": {
+        "owner": "JaSpa",
+        "repo": "minisat",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1684911969,
@@ -93,6 +109,7 @@
       "inputs": {
         "crane": "crane",
         "flake-utils": "flake-utils_2",
+        "minisat-patched-src": "minisat-patched-src",
         "nixpkgs": "nixpkgs"
       }
     },

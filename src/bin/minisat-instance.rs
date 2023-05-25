@@ -2,6 +2,7 @@ use cpp::cpp;
 
 cpp! {{
     #include <iostream>
+    #include <minisat/core/Solver.h>
 }}
 
 fn main() {
@@ -12,5 +13,7 @@ fn main() {
 
     cpp!(unsafe [i as "int32_t"] {
         std::cout << "Hi from rusty c++ " << i << "\n";
+        Solver s;
+        std::cout << "I created a solver!\n";
     })
 }
