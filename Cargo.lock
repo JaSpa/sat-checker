@@ -364,13 +364,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
 
 [[package]]
-name = "minisat-tests"
+name = "minisat-instance"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cpp",
+ "cpp_build",
+]
+
+[[package]]
+name = "minisat-test-runner"
 version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
- "cpp",
- "cpp_build",
  "getrandom",
  "rand",
 ]

@@ -13,7 +13,7 @@ fn main() {
 
     cpp!(unsafe [i as "int32_t"] {
         std::cout << "Hi from rusty c++ " << i << "\n";
-        Solver s;
+        Minisat::Solver s;
         std::cout << "I created a solver!\n";
     })
 }

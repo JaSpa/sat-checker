@@ -1,0 +1,11 @@
+[package]
+name = "minisat-instance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.3.0", features = ["cargo", "derive", "wrap_help"] }
+cpp = "0.5.8"
+
+[build-dependencies]
+cpp_build = "0.5.8"
