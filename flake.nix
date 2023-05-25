@@ -24,6 +24,10 @@
 
         minisat-tests = craneLib.buildPackage {
           src = craneLib.cleanCargoSource (craneLib.path ./.);
+          buildInputs = lib.optionals pkgs.stdenv.isDarwin [
+            # Required to avoid a linker error on darwin.
+            pkgs.libiconv
+          ];
         };
       in {
         formatter = pkgs.alejandra;
@@ -33,8 +37,8 @@
         };
 
         devShells.default = pkgs.mkShell {
+          inputsFrom = [minisat-tests];
           packages = with pkgs; [
-            cargo
           ];
         };
       }
