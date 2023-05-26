@@ -37,6 +37,10 @@ fn main() -> io::Result<()> {
             break;
         }
 
+        // Echo command.
+        println!("r  {}", line);
+        io::stdout().flush().expect("stdout broken");
+
         let parts = line.split_ascii_whitespace().collect::<Vec<_>>();
 
         // Skip empty lines.

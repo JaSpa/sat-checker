@@ -595,6 +595,7 @@ mod relay {
                     };
                     (Event::UNSAT(confl), true)
                 }
+                Some("r") => return Ok((verbose, "", None)),
                 Some(_) => return Ok((true, "", None)),
             };
 
