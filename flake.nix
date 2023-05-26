@@ -3,6 +3,11 @@
 
   inputs.flake-utils.url = github:numtide/flake-utils;
 
+  inputs.rust-overlay.url = github:oxalica/rust-overlay;
+  inputs.rust-overlay.inputs = {
+    nixpkgs.follows = "nixpkgs";
+  };
+
   inputs.crane.url = github:ipetkov/crane;
   inputs.crane.inputs = {
     nixpkgs.follows = "nixpkgs";
@@ -16,6 +21,7 @@
     nixpkgs,
     flake-utils,
     crane,
+    rust-overlay,
     minisat-mod-src,
   }:
     flake-utils.lib.eachDefaultSystem (
@@ -38,10 +44,13 @@
 
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [overlay];
+          overlays = [
+            overlay
+            (import rust-overlay)
+          ];
         };
 
-        craneLib = crane.lib.${system};
+        craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.nightly."2023-05-24".default;
 
         mkArgs = attrs @ {buildInputs ? [], ...}:
           attrs
@@ -105,20 +114,25 @@
               nativeBuildInputs = [pkgs.makeWrapper];
             } ''
               mkdir -p $out/bin
-              makeWrapper ${selfp.minisat-test-runner}/bin/minisat-test-runner  \
-                  $out/bin/minisat-runner                                       \
-                --set-default MINISAT_TEST_RUNNER_INSTANCE_A                    \
-                  ${selfp.minisat-instance-orig}/bin/minisat-instance           \
-                --set-default MINISAT_TEST_RUNNER_INSTANCE_B                    \
+              makeWrapper \
+                  ${selfp.minisat-test-runner}/bin/minisat-test-runner        \
+                  $out/bin/minisat-runner                                     \
+                --set-default MINISAT_TEST_RUNNER_INSTANCE_A                  \
+                  ${selfp.minisat-instance-orig}/bin/minisat-instance         \
+                --set-default MINISAT_TEST_RUNNER_INSTANCE_B                  \
                   ${selfp.minisat-instance-mod}/bin/minisat-instance
             '';
         };
 
+        apps.default.type = "app";
+        apps.default.program = "${selfp.minisat-runner}/bin/minisat-runner";
+
         devShells.default = pkgs.mkShell {
           inputsFrom = [selfp.minisat-instance-orig minisat-test-runner];
-          packages = with pkgs; lib.optionals (!pkgs.stdenv.isDarwin) [
-            lldb
-          ];
+          packages = with pkgs;
+            lib.optionals (!pkgs.stdenv.isDarwin) [
+              lldb
+            ];
         };
       }
     );
