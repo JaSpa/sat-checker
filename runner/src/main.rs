@@ -218,13 +218,15 @@ mod coordinator {
         }
 
         fn make_sized(self, size: usize) -> SizedCoordinator {
+            let max_assump_size = if size < 5 { size } else { size * 2 / 3 };
+            let hist_steps = if size / 16 <= 1 { size } else { 16 };
             SizedCoordinator {
                 data: self.0,
                 rng: SmallRng::seed_from_u64(self.1),
                 var_count: size as i32,
-                count_distrib: rand::distributions::Uniform::new(2, size * 2 / 3),
+                count_distrib: rand::distributions::Uniform::new(1, max_assump_size),
                 chosen_sizes: ndhistogram!(
-                    UniformNoFlow::with_step_size(16, 0, (size / 16) + 1);
+                    UniformNoFlow::with_step_size(hist_steps, 0, (size / 16) + 1);
                     usize
                 ),
                 sat_challenges: PatriciaSet::new(),
@@ -364,7 +366,15 @@ mod coordinator {
         }
 
         async fn perform_challenge(&mut self, assumptions: Sorted<i32>) -> Result<()> {
-            println!("Challenging with {} assumptions", assumptions.len());
+            println!(
+                "Challenging with {} {}",
+                assumptions.len(),
+                if assumptions.len() == 1 {
+                    "assumption"
+                } else {
+                    "assumptions"
+                }
+            );
             if self.data.verbose {
                 println!("  {}", WriteJoined::by_space(&assumptions))
             }
@@ -489,9 +499,13 @@ mod coordinator {
                 .iter()
                 .filter_map(|bucket| {
                     let BinInterval::Bin { start, end } = bucket.bin else {
-                    return None
-                };
-                    Some(format!("{start}-{end}"))
+                        return None
+                    };
+                    Some(if start + 1 == end {
+                        start.to_string()
+                    } else {
+                        format!("{start}-{end}", end = end - 1)
+                    })
                 })
                 .collect::<Vec<_>>();
             let label_length = labels.iter().map(|lbl| lbl.len()).max().unwrap_or(0);
