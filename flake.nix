@@ -36,6 +36,7 @@
           }));
 
           minisat-mod = minisat-orig.overrideAttrs (o: {
+            version = "${o.version}-mod";
             src = minisat-mod-src;
           });
         };
