@@ -10,6 +10,9 @@ use clap::Parser;
 struct Args {
     /// Path to underlying instance in DIMACS format.
     instance: PathBuf,
+
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -20,8 +23,12 @@ fn main() -> io::Result<()> {
 
     // Create the solver.
     let mut solver = ffi::Solver::new();
+    solver.verbose(args.verbose);
     // Read the instance.
     solver.read_instance(args.instance)?;
+    if !solver.ok() {
+        eprintln!("solver is broken after reading the instance");
+    }
     // Respond with the number of variables occuring inside the instance.
     let inst_size = solver.var_count();
     println!("n  {inst_size}");
@@ -38,7 +45,7 @@ fn main() -> io::Result<()> {
         }
 
         // Echo command.
-        println!("r  {}", line);
+        println!("r  {}", line.trim_end());
         io::stdout().flush().expect("stdout broken");
 
         let parts = line.split_ascii_whitespace().collect::<Vec<_>>();
@@ -54,6 +61,12 @@ fn main() -> io::Result<()> {
                 break;
             }
             "s" => {
+                if !solver.ok() {
+                    eprintln!("solver is not ok");
+                    println!("U");
+                    io::stdout().flush()?;
+                }
+
                 // Solve with the following assumptions.
                 let Ok(assumptions) = parts[1..].iter().map(|s| s.parse::<ffi::Lit>()).collect::<Result<Vec<_>, _>>() else {
                     eprintln!("failed to parse literals in solve command: {line}");
@@ -96,7 +109,10 @@ mod ffi {
 
     use cpp::cpp;
 
-    pub struct Solver(NonNull<ffi::c_void>);
+    pub struct Solver {
+        ok: bool,
+        ptr: NonNull<ffi::c_void>,
+    }
 
     pub type Lit = ffi::c_int;
 
@@ -115,16 +131,31 @@ mod ffi {
                 let ptr = cpp!([] -> *mut ffi::c_void as "Solver*" {
                     return new Solver;
                 });
-                Solver(NonNull::new(ptr).expect("allocation failure"))
+                Solver {
+                    ok: true,
+                    ptr: NonNull::new(ptr).expect("allocation failure"),
+                }
             }
         }
 
+        pub fn ok(&self) -> bool {
+            self.ok
+        }
+
+        pub fn verbose(&mut self, verbose: bool) {
+            self.with_mut_ptr(|ptr| {
+                cpp!(unsafe [ptr as "Solver*", verbose as "bool"] {
+                    ptr->verbosity = verbose ? 1 : 0;
+                })
+            })
+        }
+
         fn with_ptr<R>(&self, body: impl FnOnce(*const ffi::c_void) -> R) -> R {
-            body(self.0.as_ptr())
+            body(self.ptr.as_ptr())
         }
 
         fn with_mut_ptr<R>(&mut self, body: impl FnOnce(*mut ffi::c_void) -> R) -> R {
-            body(self.0.as_ptr())
+            body(self.ptr.as_ptr())
         }
 
         pub fn var_count(&self) -> usize {
@@ -136,6 +167,10 @@ mod ffi {
         }
 
         pub fn read_instance(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+            if !self.ok {
+                return Ok(());
+            }
+
             let encoded_path = {
                 let os_path = path.as_ref().as_os_str();
                 let mut os_bytes = os_path.as_bytes().to_vec();
@@ -157,11 +192,23 @@ mod ffi {
                 })
             });
 
-            if good {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
+            if !good {
+                return Err(io::Error::last_os_error());
             }
+
+            let solver_ok = self.with_mut_ptr(|ptr| {
+                cpp!(unsafe [ptr as "Solver*"] -> bool as "bool" {
+                    if (!ptr->okay())
+                        return false;
+                    if (!ptr->simplify())
+                        return false;
+                    return true;
+                })
+            });
+
+            self.ok = solver_ok;
+
+            Ok(())
         }
 
         fn read_conflict(&self) -> Vec<Lit> {
@@ -180,7 +227,9 @@ mod ffi {
                     for (size_t i = 0, n = confl.size(); i < n; ++i) {
                         // Translate *2+1 back to +/- encoding.
                         Lit c = confl[i];
-                        cptr[i] = sign(c) ? -var(c) : var(c);
+                        cptr[i] = var(c) + 1;
+                        if (sign(c))
+                            cptr[i] *= -1;
                     }
                 });
 
@@ -189,7 +238,9 @@ mod ffi {
         }
 
         pub fn solve(&mut self, assumptions: &[Lit]) -> Result<(), Vec<Lit>> {
-            let success =self.with_mut_ptr(|ptr| {
+            assert!(self.ok, "solver is not ok");
+
+            let success = self.with_mut_ptr(|ptr| {
                 let a_ptr = assumptions.as_ptr();
                 let a_cnt = assumptions.len();
                 cpp!(unsafe [ptr as "Solver*", a_ptr as "const int*", a_cnt as "size_t"] -> bool as "bool" {
@@ -197,8 +248,7 @@ mod ffi {
                     vec<Lit> assumptions(a_cnt);
                     for (size_t i = 0; i < a_cnt; ++i) {
                         // Translate pos/neg to minisat's internal encoding.
-                        Lit a = mkLit(abs(a_ptr[i]) - 1, /*neg=*/a_ptr[i] < 0);
-                        assumptions.push(a);
+                        assumptions[i] = mkLit(abs(a_ptr[i]) - 1, /*neg=*/a_ptr[i] < 0);
                     }
 
                     return ptr->solve(assumptions);
