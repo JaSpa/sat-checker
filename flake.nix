@@ -123,10 +123,23 @@
                 --set-default MINISAT_TEST_RUNNER_INSTANCE_B                  \
                   ${selfp.minisat-instance-mod}/bin/minisat-instance
             '';
+
+          link-builder =
+            pkgs.writeShellScriptBin "build-links.sh" ''
+              set -e
+
+              prefix=result-${lib.escapeShellArg system}
+              nix build .#minisat-instance-orig -o "$prefix-a"
+              nix build .#minisat-instance-mod  -o "$prefix-b"
+              nix build .#minisat-test-runner   -o "$prefix-runner"
+            '';
         };
 
         apps.default.type = "app";
         apps.default.program = "${selfp.minisat-runner}/bin/minisat-runner";
+
+        apps.build-links.type = "app";
+        apps.build-links.program = "${selfp.link-builder}/bin/build-links.sh";
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [selfp.minisat-instance-orig minisat-test-runner];
