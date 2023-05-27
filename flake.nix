@@ -26,19 +26,51 @@
   }:
     flake-utils.lib.eachDefaultSystem (
       system: let
-        overlay = final: prev: rec {
-          minisat-orig = final.enableDebugging (prev.minisat.overrideAttrs (o: {
-            # minisat has references to zlib headers in its own headers,
-            # propagation is missing in original definition.
-            propagatedBuildInputs = [final.zlib];
-            cmakeFlags = (o.cmakeFlags or []) ++ ["-DCMAKE_BUILD_TYPE=Debug"];
-            dontStrip = true;
-          }));
+        withDebugAttr = mkDrv: attrs @ {debugging ? false, ...}: let
+          debuggingDrv = mkDrv (attrs // {debugging = true;});
+        in
+          if debugging
+          then debuggingDrv
+          else
+            lib.lazyDerivation {
+              derivation = mkDrv (attrs // {debugging = false;});
+              passthru = {debug = debuggingDrv;};
+            };
 
-          minisat-mod = minisat-orig.overrideAttrs (o: {
-            version = "${o.version}-mod";
-            src = minisat-mod-src;
-          });
+        overlay = final: prev: {
+          enableDebuggingIf = cond: drv:
+            if cond
+            then final.enableDebugging drv
+            else drv;
+
+          minisat-orig = withDebugAttr (
+            {
+              debugging,
+              overrides ? (_: {}),
+            }: let
+              drv = prev.minisat.overrideAttrs (o:
+                {
+                  # minisat has references to zlib headers in its own headers,
+                  # propagation is missing in original definition.
+                  propagatedBuildInputs = [final.zlib];
+                }
+                // lib.attrsets.optionalAttrs debugging {
+                  cmakeFlags = (o.cmakeFlags or []) ++ ["-DCMAKE_BUILD_TYPE=Debug"];
+                  dontStrip = true;
+                }
+                // overrides o);
+            in
+              final.enableDebuggingIf debugging drv
+          );
+
+          minisat-mod = withDebugAttr ({debugging}:
+            final.minisat-orig {
+              inherit debugging;
+              overrides = o: {
+                version = "${o.version}-mod";
+                src = minisat-mod-src;
+              };
+            });
         };
 
         inherit (pkgs) lib;
@@ -53,8 +85,12 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.nightly."2023-05-24".default;
 
-        mkArgs = attrs @ {buildInputs ? [], ...}:
-          attrs
+        mkArgs = attrs @ {
+          buildInputs ? [],
+          debugging ? false,
+          ...
+        }:
+          builtins.removeAttrs attrs ["debugging"]
           // {
             src = craneLib.cleanCargoSource (craneLib.path ./.);
             buildInputs =
@@ -63,76 +99,103 @@
                 # Required to avoid a linker error on darwin.
                 pkgs.libiconv
               ];
+          }
+          // lib.attrsets.optionalAttrs debugging {
+            CARGO_PROFILE = "";
+            dontStrip = true;
           };
 
-        minisat-instance = {
+        minisat-instance = withDebugAttr ({
           name,
           minisat,
+          debugging,
         }: let
           cargoName = craneLib.crateNameFromCargoToml {cargoToml = ./instance/Cargo.toml;};
           attrs = mkArgs {
+            inherit debugging;
             inherit (cargoName) version;
             pname = "${cargoName.pname}-${name}";
 
-            cargoExtraArgs = "--workspace --exclude minisat-test-runner";
-            CARGO_PROFILE = "";
-            dontStrip = true;
+            cargoExtraArgs = "--package minisat-instance";
 
             buildInputs = [
-              minisat
+              (minisat {inherit debugging;})
               pkgs.zlib
             ];
           };
         in
-          craneLib.buildPackage attrs;
+          # TODO: check if it is possible (or necessary?) to use
+          # `enableDebugging` with crane. The problem is that the result of
+          # `craneLib.buildPackage` does not have an `override` (which is used
+          # by `enableDebugging`).
+          pkgs.enableDebuggingIf (false && debugging) (craneLib.buildPackage attrs));
 
-        minisat-test-runner = let
+        sat-runner = withDebugAttr ({debugging}: let
           attrs =
-            mkArgs {cargoExtraArgs = "--workspace --exclude minisat-instance";}
-            // craneLib.crateNameFromCargoToml {cargoToml = ./runner/Cargo.toml;};
+            craneLib.crateNameFromCargoToml {cargoToml = ./runner/Cargo.toml;}
+            // mkArgs {
+              inherit debugging;
+              cargoExtraArgs = "--package sat-runner";
+            };
         in
-          craneLib.buildPackage attrs;
+          # TODO: check if it is possible (or necessary?) to use
+          # `enableDebugging` with crane. The problem is that the result of
+          # `craneLib.buildPackage` does not have an `override` (which is used
+          # by `enableDebugging`).
+          pkgs.enableDebuggingIf (false && debugging) (craneLib.buildPackage attrs));
 
-        selfp = self.packages.${system};
+        minisat-runner = withDebugAttr ({debugging}: let
+          debugOrRelease = lib.getAttrFromPath (lib.optional debugging "debug");
+        in
+          pkgs.runCommandLocal "minisat-runner" {
+            nativeBuildInputs = [pkgs.makeWrapper];
+          } ''
+            mkdir -p $out/bin
+            makeWrapper \
+                ${debugOrRelease selfp.sat-runner}/bin/sat-runner                 \
+                $out/bin/minisat-runner                                           \
+              --set-default MINISAT_TEST_RUNNER_INSTANCE_A                        \
+                ${debugOrRelease selfp.minisat-solver.orig}/bin/minisat-instance  \
+              --set-default MINISAT_TEST_RUNNER_INSTANCE_B                        \
+                ${debugOrRelease selfp.minisat-solver.mod}/bin/minisat-instance
+          '');
+
+        # Combinations of all (legacy) packages defined in this flake for this system.
+        selfp = (self.packages.${system} or {}) // (self.legacyPackages.${system} or {});
       in {
         formatter = pkgs.alejandra;
 
+        legacyPackages = {
+          minisat-solver = {
+            orig = minisat-instance {
+              name = "orig";
+              minisat = selfp.minisat-orig;
+            };
+            mod = minisat-instance {
+              name = "mod";
+              minisat = selfp.minisat-mod;
+            };
+          };
+
+          sat-runner = sat-runner {};
+
+          # `minisat-runner` is a specialization of `sat-runner` to our two
+          # versions of the minisat solver.
+          minisat-runner = minisat-runner {};
+        };
+
         packages = with pkgs; {
-          inherit minisat-orig minisat-mod minisat-test-runner;
+          inherit minisat-orig minisat-mod;
 
-          minisat-instance-orig = minisat-instance {
-            name = "orig";
-            minisat = selfp.minisat-orig;
-          };
+          link-builder = pkgs.writeShellScriptBin "build-links.sh" ''
+            set -e
+            prefix=result-${lib.escapeShellArg system}
+            nix build .#minisat-solver.orig.debug -o "$prefix-a"
+            nix build .#minisat-solver.mod.debug  -o "$prefix-b"
+            nix build .#sat-runner.debug          -o "$prefix-runner"
+          '';
 
-          minisat-instance-mod = minisat-instance {
-            name = "mod";
-            minisat = selfp.minisat-mod;
-          };
-
-          minisat-runner =
-            pkgs.runCommandLocal "minisat-runner" {
-              nativeBuildInputs = [pkgs.makeWrapper];
-            } ''
-              mkdir -p $out/bin
-              makeWrapper \
-                  ${selfp.minisat-test-runner}/bin/minisat-test-runner        \
-                  $out/bin/minisat-runner                                     \
-                --set-default MINISAT_TEST_RUNNER_INSTANCE_A                  \
-                  ${selfp.minisat-instance-orig}/bin/minisat-instance         \
-                --set-default MINISAT_TEST_RUNNER_INSTANCE_B                  \
-                  ${selfp.minisat-instance-mod}/bin/minisat-instance
-            '';
-
-          link-builder =
-            pkgs.writeShellScriptBin "build-links.sh" ''
-              set -e
-
-              prefix=result-${lib.escapeShellArg system}
-              nix build .#minisat-instance-orig -o "$prefix-a"
-              nix build .#minisat-instance-mod  -o "$prefix-b"
-              nix build .#minisat-test-runner   -o "$prefix-runner"
-            '';
+          default = selfp.minisat-runner;
         };
 
         apps.default.type = "app";
@@ -142,7 +205,7 @@
         apps.build-links.program = "${selfp.link-builder}/bin/build-links.sh";
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [selfp.minisat-instance-orig minisat-test-runner];
+          inputsFrom = [selfp.minisat-solver.orig selfp.sat-runner];
           packages = with pkgs;
             lib.optionals (!pkgs.stdenv.isDarwin) [
               lldb

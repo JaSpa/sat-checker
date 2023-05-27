@@ -1,5 +1,5 @@
 [package]
-name = "minisat-test-runner"
+name = "sat-runner"
 version = "0.1.0"
 edition = "2021"
 
