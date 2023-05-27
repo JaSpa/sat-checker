@@ -86,6 +86,9 @@ async fn main() -> Result<()> {
 
     coordinator.await??;
     stream_relay.await??;
+    a.wait().await?;
+    b.wait().await?;
+
     Ok(())
 }
 
@@ -226,7 +229,7 @@ mod coordinator {
                 var_count: size as i32,
                 count_distrib: rand::distributions::Uniform::new(1, max_assump_size),
                 chosen_sizes: ndhistogram!(
-                    UniformNoFlow::with_step_size(hist_steps, 0, (size / 16) + 1);
+                    UniformNoFlow::with_step_size(hist_steps, 1, (size / 16) + 1);
                     usize
                 ),
                 sat_challenges: PatriciaSet::new(),
@@ -330,11 +333,12 @@ mod coordinator {
                 Tag::B => &mut self.data.b,
             };
 
-            handle.write_all(b"s").await?;
+            handle.write_u8(b's').await?;
             for v in challenge {
                 handle.write_u8(b' ').await?;
                 handle.write_all(v.to_string().as_bytes()).await?;
             }
+            handle.write_u8(b'\n').await?;
             handle.flush().await?;
             Ok(())
         }
@@ -402,7 +406,11 @@ mod coordinator {
                     return Ok(());
                 }
 
-                (Some(a_confl), Some(b_confl)) => {
+                (Some(mut a_confl), Some(mut b_confl)) => {
+                    for x in a_confl.iter_mut().chain(b_confl.iter_mut()) {
+                        *x = -*x;
+                    }
+
                     let xs = Sorted::new(a_confl);
                     let ys = Sorted::new(b_confl);
                     let m = xs.len();
@@ -434,7 +442,7 @@ mod coordinator {
                     concat!(
                         "conflict from A not a subset of the assumptions\n",
                         "  assumptions: {}\n",
-                        "     conflict: {}\n"
+                        "     conflict: {}"
                     ),
                     WriteJoined::by_space(&assumptions),
                     WriteJoined::by_space(&a_confl),
@@ -445,7 +453,7 @@ mod coordinator {
                     concat!(
                         "conflict from B not a subset of the assumptions\n",
                         "  assumptions: {}\n",
-                        "     conflict: {}\n"
+                        "     conflict: {}"
                     ),
                     WriteJoined::by_space(&assumptions),
                     WriteJoined::by_space(&b_confl),
@@ -471,7 +479,7 @@ mod coordinator {
                     concat!(
                         "conflict returned by B is not a conflict in A\n",
                         "    assumptions: {}\n",
-                        "  conflict by B: {}\n",
+                        "  conflict by B: {}",
                     ),
                     WriteJoined::by_space(&assumptions),
                     WriteJoined::by_space(&b_confl),
@@ -482,7 +490,7 @@ mod coordinator {
                     concat!(
                         "conflict returned by A is not a conflict in B\n",
                         "    assumptions: {}\n",
-                        "  conflict by A: {}\n",
+                        "  conflict by A: {}",
                     ),
                     WriteJoined::by_space(&assumptions),
                     WriteJoined::by_space(&a_confl),
@@ -608,7 +616,8 @@ mod relay {
 
         fn handle_line(&mut self, events: &EventsSend, index: usize) -> Result<()> {
             let buf = &mut self.buffers[index];
-            let ln = String::from_utf8_lossy(buf);
+            let full_line = String::from_utf8_lossy(buf);
+            let ln = full_line.trim_end();
             let opt_ev = match Self::parse_line(self.verbose, &ln) {
                 Ok((print, warn, opt_ev)) => {
                     if print && !warn.is_empty() {
