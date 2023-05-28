@@ -1,3 +1,376 @@
+use std::fmt;
+
+use color_eyre::Result;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    A,
+    B,
+}
+
+impl Tag {
+    fn select<T>(self, a: T, b: T) -> T {
+        match self {
+            Tag::A => a,
+            Tag::B => b,
+        }
+    }
+
+    fn to_str(self) -> &'static str {
+        self.select("A", "B")
+    }
+}
+
+impl fmt::Display for Tag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.to_str())
+    }
+}
+
+mod cmd {
+    use std::{
+        ffi::{OsStr, OsString},
+        mem::MaybeUninit,
+        path::PathBuf,
+        sync::Once,
+    };
+
+    use crate::Tag;
+
+    #[derive(clap::Parser)]
+    struct ArgsParser {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[derive(Debug, clap::Args)]
+    pub struct Args {
+        /// Path to the solver executable A.
+        #[arg(long, env)]
+        pub solver_a: PathBuf,
+
+        /// Path to the solver executable B.
+        #[arg(long, env)]
+        pub solver_b: PathBuf,
+
+        /// Name prefix to use when outputting messages by solver A.
+        #[arg(long, default_value = "A")]
+        pub name_a: String,
+
+        /// Name prefix to use when outputting messages by solver B.
+        #[arg(long, default_value = "B")]
+        pub name_b: String,
+
+        /// Enable verbose mode.
+        #[arg(short, long)]
+        pub verbose: bool,
+
+        /// Arguments passed to the solver executables.
+        pub solver_args: Vec<OsString>,
+    }
+
+    static ARGS_PARSED: Once = Once::new();
+    static mut ARGS: MaybeUninit<Args> = MaybeUninit::uninit();
+
+    pub fn args() -> &'static Args {
+        ARGS_PARSED.call_once(|| {
+            use clap::Parser;
+            let args = ArgsParser::parse().args;
+            unsafe {
+                ARGS.write(args);
+            }
+        });
+
+        // We know that initialization has completed. We only hand out un-mutable references, which
+        // is safe.
+        unsafe { ARGS.assume_init_ref() }
+    }
+
+    impl Args {
+        pub(crate) fn solver_exe(&self, tag: Tag) -> &OsStr {
+            tag.select(&self.solver_a, &self.solver_b).as_os_str()
+        }
+
+        pub(crate) fn solver_name(&self, tag: Tag) -> &str {
+            tag.select(&self.name_a, &self.name_b)
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _solver_a = solver::launch(Tag::A)?;
+    let _solver_b = solver::launch(Tag::B)?;
+
+    Ok(())
+}
+
+mod solver {
+    use std::{io, process::Stdio, str::FromStr};
+
+    use color_eyre::{
+        eyre::{eyre, Context},
+        Result,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncRead, BufReader},
+        process,
+        sync::{
+            mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+            oneshot,
+        },
+        task::JoinHandle,
+    };
+
+    use crate::{cmd, Tag};
+
+    pub enum Event {
+        Sat,
+        Unsat(Vec<i64>),
+    }
+
+    /// Represents the connection to a running solver process.
+    pub struct Solver {
+        child_handle: process::Child,
+        relay_handle: JoinHandle<()>,
+        event_output: UnboundedReceiver<Event>,
+        instance_size_recv: oneshot::Receiver<i64>,
+    }
+
+    pub(crate) fn launch(tag: Tag) -> Result<Solver> {
+        // Build command as a std command because it supports formatting as shell-like output.
+        let mut cmd = std::process::Command::new(cmd::args().solver_exe(tag));
+        cmd.args(&cmd::args().solver_args);
+        if cmd::args().verbose {
+            println!("launching solver {tag}\n  {:?}", cmd);
+        }
+
+        // Convert to a tokio command before executing.
+        let mut child_handle = tokio::process::Command::from(cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Create channels for interaction.
+        let (event_send, event_output) = unbounded_channel();
+        let (instance_size_send, instance_size_recv) = oneshot::channel();
+
+        // Spawn the relaying thread.
+        let relay_handle =
+            start_output_relay(tag, &mut child_handle, event_send, instance_size_send);
+
+        // Return the solver instance.
+        Ok(Solver {
+            child_handle,
+            relay_handle,
+            event_output,
+            instance_size_recv,
+        })
+    }
+
+    fn start_output_relay(
+        tag: Tag,
+        process: &mut process::Child,
+        event_output: UnboundedSender<Event>,
+        size_output: oneshot::Sender<i64>,
+    ) -> JoinHandle<()> {
+        let out = process
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                eyre!(
+                    "output not piped from solver {}",
+                    cmd::args().solver_name(tag)
+                )
+            })
+            .unwrap();
+        let err = process
+            .stderr
+            .take()
+            .ok_or_else(|| {
+                eyre!(
+                    "output not piped from solver {}",
+                    cmd::args().solver_name(tag)
+                )
+            })
+            .unwrap();
+        tokio::spawn(async move {
+            let name = cmd::args().solver_name(tag);
+            _ = tokio::join!(
+                // stdout is parsed.
+                ProcessingRelay::new(event_output, size_output).relay_output(&name, out),
+                // stderr is not parsed but simply relayed.
+                UnfilteredRelay.relay_output(&name, err),
+            )
+        })
+    }
+
+    #[async_trait::async_trait]
+    trait OutputRelay {
+        /// Process the line and decide wether it should be shown to the user.
+        fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str>;
+
+        async fn relay_output(
+            mut self,
+            name: &str,
+            reader: impl AsyncRead + Send + std::marker::Unpin,
+        ) where
+            Self: Sized,
+        {
+            use std::io::Write;
+
+            let mut buf = Vec::new();
+            let mut buf_reader = BufReader::new(reader);
+
+            loop {
+                buf.clear();
+                let n = buf_reader
+                    .read_until(b'\n', &mut buf)
+                    .await
+                    .wrap_err_with(|| format!("communication with solver {name} failed"))
+                    .unwrap();
+
+                // If we've reached EOF simply return.
+                if n == 0 {
+                    return;
+                }
+
+                // Process the read string.
+                //
+                // Strip trailing whitespace.
+                let Some(end_idx) = buf.iter().rposition(|&b| !b.is_ascii_whitespace()) else {
+                    continue;
+                };
+                let line = &buf[..=end_idx];
+
+                // Parse the line and decide wether to output.
+                let res = self.process_line(line);
+                if res == Ok(true) || res.is_err() {
+                    let mut out = io::stdout().lock();
+                    write!(out, "{}> ", name)
+                        .and_then(|_| out.write_all(line))
+                        .and_then(|_| writeln!(out))
+                        .and_then(|_| {
+                            if let Err(warning) = res {
+                                writeln!(out, "* warning: {warning}")
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .wrap_err_with(|| format!("failed to relay message from solver {name}"))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    struct UnfilteredRelay;
+
+    impl OutputRelay for UnfilteredRelay {
+        fn process_line(&mut self, _line: &[u8]) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+    }
+
+    struct ProcessingRelay {
+        event_output: UnboundedSender<Event>,
+        size_output: Option<oneshot::Sender<i64>>,
+    }
+
+    impl ProcessingRelay {
+        fn new(event_output: UnboundedSender<Event>, size_output: oneshot::Sender<i64>) -> Self {
+            ProcessingRelay {
+                event_output,
+                size_output: Some(size_output),
+            }
+        }
+    }
+
+    impl OutputRelay for ProcessingRelay {
+        fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str> {
+            fn parse_slice<T: FromStr>(slice: &[u8]) -> Option<T> {
+                std::str::from_utf8(slice).ok().and_then(|s| s.parse().ok())
+            }
+
+            let mut components = line.split(u8::is_ascii_whitespace);
+
+            match components.next() {
+                // Comment/empty line. Skip
+                Some(b"c") | None => return Ok(false),
+
+                // SIZE answer.
+                //
+                // TODO: we might want to support multiple modes in our command interface to
+                // silence this and similar warnings or to turn them into hard errors.
+                Some(b"n") => {
+                    // We expect to parse exactly one number.
+                    let Some(n) = components.next() else {
+                        return Err("not interpreted as a SIZE answer (missing number)");
+                    };
+                    let None = components.next() else {
+                        return Err("not interpreted as a SIZE answer (additional content)");
+                    };
+                    let Some(n) = parse_slice::<i64>(n) else {
+                        return Err("not interpreted as a SIZE answer (can't parse number)");
+                    };
+                    let Some(size_chan) = self.size_output.take() else {
+                        return Err("not interpreted as a SIZE answer (size already received)");
+                    };
+                    _ = size_chan.send(n);
+                }
+
+                // SAT answer.
+                Some(b"S") => {
+                    let None = components.next() else {
+                        return Err("not interpreted as SAT answer (additional content)");
+                    };
+                    _ = self.event_output.send(Event::Sat);
+                }
+
+                // UNSAT answer.
+                Some(b"U") => {
+                    let Some(conflict) = components
+                        .map(parse_slice::<i64>)
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err("not interpreted as UNSAT answer (failed to parse conflict set)");
+                    };
+
+                    _ = self.event_output.send(Event::Unsat(conflict));
+                }
+
+                // not a recognized command, print.
+                Some(_) => return Ok(true),
+            }
+
+            // Print commands if we are in verbose mode.
+            Ok(cmd::args().verbose)
+        }
+    }
+}
+
+/*
+mod util {
+    use std::future::{self, Future, IntoFuture};
+
+    pub trait ResultEx<T, E> {
+        fn catch(inner: impl FnOnce() -> Result<T, E>) -> Self;
+        fn catch_eventually<F>(inner: F) -> F::IntoFuture
+        where
+            F: IntoFuture<Output = Result<T, E>>;
+    }
+
+    impl<T, E> ResultEx<T, E> for Result<T, E> {
+        fn catch(inner: impl FnOnce() -> Result<T, E>) -> Self {
+            inner()
+        }
+
+    }
+}
+*/
+
+/*
 #![feature(iter_collect_into)]
 
 use std::{
@@ -778,3 +1151,4 @@ mod util {
         }
     }
 }
+*/
