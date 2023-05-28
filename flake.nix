@@ -197,8 +197,12 @@
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [selfp.minisat-solver.orig selfp.sat-runner];
+          # Somehow: inputs aren't propagated properly.
           packages =
-            lib.optionals (!pkgs.stdenv.isDarwin) [
+            [
+              (pkgs.minisat-orig {})
+            ]
+            ++ lib.optionals (!pkgs.stdenv.isDarwin) [
               pkgs.lldb
             ]
             ++ lib.optionals pkgs.stdenv.isDarwin [
