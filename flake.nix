@@ -206,9 +206,12 @@
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [selfp.minisat-solver.orig selfp.sat-runner];
-          packages = with pkgs;
+          packages =
             lib.optionals (!pkgs.stdenv.isDarwin) [
-              lldb
+              pkgs.lldb
+            ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.libiconv
             ];
         };
       }
