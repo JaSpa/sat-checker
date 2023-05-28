@@ -1,9 +1,9 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use color_eyre::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tag {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Tag {
     A,
     B,
 }
@@ -24,6 +24,17 @@ impl Tag {
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(self.to_str())
+    }
+}
+
+impl FromStr for Tag {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "A" | "a" => Ok(Tag::A),
+            "B" | "b" => Ok(Tag::B),
+            _ => Err(()),
+        }
     }
 }
 
@@ -61,6 +72,18 @@ mod cmd {
         #[arg(long, default_value = "B")]
         pub name_b: String,
 
+        /// sat-runner requires the input to be satisfiable. With this flag the first challenge
+        /// posed to the solvers is to check for SAT without any assumptions. Otherwise, it is
+        /// assumed to be satisfiable.
+        #[arg(long = "check")]
+        pub check_initially: bool,
+
+        /// Tell sat-runner that the specified solver's result is to be trusted. I.e. don't pass
+        /// its results to the other solver for verification. If this option is not given, both
+        /// solvers' results are passed to the other one for verification.
+        #[arg(long = "trust", value_enum)]
+        pub trusted_solver: Option<Tag>,
+
         /// Enable verbose mode.
         #[arg(short, long)]
         pub verbose: bool,
@@ -87,11 +110,11 @@ mod cmd {
     }
 
     impl Args {
-        pub(crate) fn solver_exe(&self, tag: Tag) -> &OsStr {
+        pub fn solver_exe(&self, tag: Tag) -> &OsStr {
             tag.select(&self.solver_a, &self.solver_b).as_os_str()
         }
 
-        pub(crate) fn solver_name(&self, tag: Tag) -> &str {
+        pub fn solver_name(&self, tag: Tag) -> &str {
             tag.select(&self.name_a, &self.name_b)
         }
     }
@@ -137,7 +160,7 @@ mod solver {
         instance_size_recv: oneshot::Receiver<i64>,
     }
 
-    pub(crate) fn launch(tag: Tag) -> Result<Solver> {
+    pub fn launch(tag: Tag) -> Result<Solver> {
         // Build command as a std command because it supports formatting as shell-like output.
         let mut cmd = std::process::Command::new(cmd::args().solver_exe(tag));
         cmd.args(&cmd::args().solver_args);
