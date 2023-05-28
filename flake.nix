@@ -3,11 +3,6 @@
 
   inputs.flake-utils.url = github:numtide/flake-utils;
 
-  inputs.rust-overlay.url = github:oxalica/rust-overlay;
-  inputs.rust-overlay.inputs = {
-    nixpkgs.follows = "nixpkgs";
-  };
-
   inputs.crane.url = github:ipetkov/crane;
   inputs.crane.inputs = {
     nixpkgs.follows = "nixpkgs";
@@ -21,7 +16,6 @@
     nixpkgs,
     flake-utils,
     crane,
-    rust-overlay,
     minisat-mod-src,
   }:
     flake-utils.lib.eachDefaultSystem (
@@ -77,13 +71,10 @@
 
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [
-            overlay
-            (import rust-overlay)
-          ];
+          overlays = [overlay];
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.nightly."2023-05-24".default;
+        craneLib = crane.lib.${system};
 
         mkArgs = attrs @ {
           buildInputs ? [],
