@@ -167,16 +167,16 @@
               minisat = selfp.minisat-mod;
             };
           };
+        };
+
+        packages = with pkgs; {
+          inherit minisat-orig minisat-mod;
 
           sat-runner = sat-runner {};
 
           # `minisat-runner` is a specialization of `sat-runner` to our two
           # versions of the minisat solver.
           minisat-runner = minisat-runner {};
-        };
-
-        packages = with pkgs; {
-          inherit minisat-orig minisat-mod;
 
           link-builder = pkgs.writeShellScriptBin "build-links.sh" ''
             set -e
