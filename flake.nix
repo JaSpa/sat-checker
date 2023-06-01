@@ -145,9 +145,9 @@
             makeWrapper \
                 ${debugOrRelease selfp.sat-runner}/bin/sat-runner                 \
                 $out/bin/minisat-runner                                           \
-              --set-default MINISAT_TEST_RUNNER_INSTANCE_A                        \
+              --set-default SAT_SOLVER_A                                          \
                 ${debugOrRelease selfp.minisat-solver.orig}/bin/minisat-instance  \
-              --set-default MINISAT_TEST_RUNNER_INSTANCE_B                        \
+              --set-default SAT_SOLVER_B                                          \
                 ${debugOrRelease selfp.minisat-solver.mod}/bin/minisat-instance
           '');
 

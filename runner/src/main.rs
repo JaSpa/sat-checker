@@ -1,6 +1,15 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, process::ExitStatus, str::FromStr};
 
-use color_eyre::Result;
+use color_eyre::{eyre::eyre, Result};
+use futures_core::future::LocalBoxFuture;
+use solver::Solver;
+use util::MergeErrors;
+
+macro_rules! concat_lines {
+    ($($ln:literal),+ $(,)?) => {
+        concat!($($ln, "\n"),+)
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Tag {
@@ -9,15 +18,25 @@ pub enum Tag {
 }
 
 impl Tag {
+    #[must_use]
     fn select<T>(self, a: T, b: T) -> T {
+        self.select_with(|| a, || b)
+    }
+
+    fn select_with<T>(self, a: impl FnOnce() -> T, b: impl FnOnce() -> T) -> T {
         match self {
-            Tag::A => a,
-            Tag::B => b,
+            Tag::A => a(),
+            Tag::B => b(),
         }
     }
 
     fn to_str(self) -> &'static str {
         self.select("A", "B")
+    }
+
+    /// Returns the other tag.
+    fn other(self) -> Self {
+        self.select(Tag::B, Tag::A)
     }
 }
 
@@ -38,6 +57,71 @@ impl FromStr for Tag {
     }
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+
+    if cmd::args().debug() {
+        eprintln!("{:#?}", cmd::args());
+    }
+
+    with_solvers(|a, b| Box::pin(run(a, b))).await
+}
+
+/// Launches the solvers and passes them to the given computation. However `inner` returns (`Err`
+/// or `Ok`) the solvers will be shut down before passing the result on.
+async fn with_solvers<R>(
+    inner: impl for<'a> FnOnce(&'a mut Solver, &'a mut Solver) -> LocalBoxFuture<'a, Result<R>>,
+) -> Result<R> {
+    let mut solver_a = solver::launch(Tag::A)?;
+    let mut solver_b = solver::launch(Tag::B)?;
+
+    let r = inner(&mut solver_a, &mut solver_b).await;
+
+    tokio::join!(
+        async { solver_a.terminate().await.map(print_solver_exit(Tag::A)) },
+        async { solver_b.terminate().await.map(print_solver_exit(Tag::B)) },
+    )
+    .merge_errors("Multiple errors occured while terminating solver processes")?;
+
+    r
+}
+
+async fn run(a: &mut Solver, b: &mut Solver) -> Result<()> {
+    let args = cmd::args();
+    let mut coordinator = coordinator::ChallengeCoordinator::new(a, b);
+
+    // Run every set of specified assumptions.
+    for assumptions in args.assume.iter() {
+        if let Some(fail) = coordinator.run_challenge(assumptions).await? {
+            println!("{}", fail);
+        }
+    }
+
+    // We did what we came here for.
+    if !cmd::args().assume.is_empty() {
+        return Ok(());
+    }
+
+    // Otherwise start the random search.
+    Err(eyre!("random search not yet implemented."))
+}
+
+fn print_solver_exit(tag: Tag) -> impl Fn(ExitStatus) {
+    move |exit| {
+        let args = cmd::args();
+        if exit.success() && !args.verbose() {
+            return;
+        }
+
+        eprintln!(
+            "Solver {} terminated with exit code {}",
+            args.solver_name(tag),
+            exit
+        );
+    }
+}
+
 mod cmd {
     use std::{
         ffi::{OsStr, OsString},
@@ -46,7 +130,7 @@ mod cmd {
         sync::Once,
     };
 
-    use crate::Tag;
+    use crate::{solver, Tag};
 
     #[derive(clap::Parser)]
     struct ArgsParser {
@@ -57,11 +141,11 @@ mod cmd {
     #[derive(Debug, clap::Args)]
     pub struct Args {
         /// Path to the solver executable A.
-        #[arg(long, env)]
+        #[arg(short = 'A', long, env = "SAT_SOLVER_A")]
         pub solver_a: PathBuf,
 
         /// Path to the solver executable B.
-        #[arg(long, env)]
+        #[arg(short = 'B', long, env = "SAT_SOLVER_B")]
         pub solver_b: PathBuf,
 
         /// Name prefix to use when outputting messages by solver A.
@@ -72,24 +156,74 @@ mod cmd {
         #[arg(long, default_value = "B")]
         pub name_b: String,
 
-        /// sat-runner requires the input to be satisfiable. With this flag the first challenge
-        /// posed to the solvers is to check for SAT without any assumptions. Otherwise, it is
-        /// assumed to be satisfiable.
-        #[arg(long = "check")]
-        pub check_initially: bool,
-
         /// Tell sat-runner that the specified solver's result is to be trusted. I.e. don't pass
         /// its results to the other solver for verification. If this option is not given, both
         /// solvers' results are passed to the other one for verification.
         #[arg(long = "trust", value_enum)]
         pub trusted_solver: Option<Tag>,
 
+        /// Start the random search from a specific seed to reproduce the sequence of tests.
+        ///
+        /// Note that the size of the test instance is an implicit parameter in generating the
+        /// sets of assumptions. Thus varying the size while keeping the seed will result in
+        /// different choices.
+        #[arg(long, group = "entrypoint")]
+        pub seed: Option<u64>,
+
+        /// Instead of performing a a random search, check a given set of comma or white-space
+        /// separated assumptions. Can be given multiple times to check different sets of
+        /// assumptions.
+        #[arg(
+            short,
+            long = "assume",
+            group = "entrypoint",
+            allow_hyphen_values = true,
+            value_parser = parse_clause,
+        )]
+        pub assume: Vec<solver::Clause>,
+
         /// Enable verbose mode.
         #[arg(short, long)]
-        pub verbose: bool,
+        verbose: bool,
+
+        /// Enable even more verbose debug output.
+        #[arg(long)]
+        debug: bool,
 
         /// Arguments passed to the solver executables.
         pub solver_args: Vec<OsString>,
+    }
+
+    /// Returns a string slice with any balanced bracketing (and potentially separating ASCII
+    /// whitespace) removed.
+    fn strip_bracketing(mut s: &str) -> &str {
+        loop {
+            s = s.trim_matches(|c: char| c.is_ascii_whitespace());
+            if s.len() < 2 {
+                return s;
+            }
+
+            let mut cs = s.chars();
+            let Some(first) = cs.next() else {
+                return "";
+            };
+            let Some(last) = cs.next_back() else {
+                return "";
+            };
+
+            match (first, last) {
+                ('(', ')') | ('{', '}') | ('[', ']') => s = cs.as_str(),
+                _ => return s,
+            }
+        }
+    }
+
+    fn parse_clause(s: &str) -> Result<solver::Clause, std::num::ParseIntError> {
+        strip_bracketing(s)
+            .split_terminator(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse())
+            .collect::<Result<_, _>>()
     }
 
     static ARGS_PARSED: Once = Once::new();
@@ -114,32 +248,43 @@ mod cmd {
             tag.select(&self.solver_a, &self.solver_b).as_os_str()
         }
 
+        /// Creates a new `std::process::Command` using the solver executable and solver arguments.
+        pub fn solver_cmd(&self, tag: Tag) -> std::process::Command {
+            let mut cmd = std::process::Command::new(self.solver_exe(tag));
+            cmd.args(&self.solver_args);
+            cmd
+        }
+
         pub fn solver_name(&self, tag: Tag) -> &str {
             tag.select(&self.name_a, &self.name_b)
         }
+
+        pub fn verbose(&self) -> bool {
+            self.verbose || self.debug
+        }
+
+        pub fn debug(&self) -> bool {
+            self.debug
+        }
     }
 }
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let _solver_a = solver::launch(Tag::A)?;
-    let _solver_b = solver::launch(Tag::B)?;
-
-    Ok(())
-}
-
 mod solver {
-    use std::{io, process::Stdio, str::FromStr};
-
-    use color_eyre::{
-        eyre::{eyre, Context},
-        Result,
+    use std::{
+        borrow::Borrow,
+        fmt, io,
+        mem::{self, MaybeUninit},
+        process::{ExitStatus, Stdio},
+        str::FromStr,
+        time::Duration,
     };
+
+    use color_eyre::{eyre::eyre, eyre::WrapErr, Help, Result};
+    use either::Either;
     use tokio::{
-        io::{AsyncBufReadExt, AsyncRead, BufReader},
+        io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, BufWriter},
         process,
         sync::{
-            mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+            mpsc::{channel, Receiver, Sender},
             oneshot,
         },
         task::JoinHandle,
@@ -147,25 +292,260 @@ mod solver {
 
     use crate::{cmd, Tag};
 
-    pub enum Event {
+    pub type Lit = i64;
+    pub type Clause = Vec<Lit>;
+    pub type ClauseRef<'a> = &'a [Lit];
+
+    pub enum Res {
         Sat,
-        Unsat(Vec<i64>),
+        Unsat(Clause),
+    }
+
+    impl Res {
+        pub fn is_sat(&self) -> bool {
+            matches!(self, Res::Sat)
+        }
+    }
+
+    impl fmt::Display for Res {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.pad(if self.is_sat() { "SAT" } else { "UNSAT" })
+        }
+    }
+
+    enum ResultRelay {
+        Open {
+            relay_handle: JoinHandle<()>,
+            result_output: Receiver<Res>,
+            instance_size: Either<oneshot::Receiver<u64>, u64>,
+        },
+        Closed {
+            result_output: Receiver<Res>,
+            instance_size: Either<oneshot::Receiver<u64>, u64>,
+        },
+    }
+
+    impl ResultRelay {
+        async fn instance_size(&mut self) -> Option<u64> {
+            let size_ref = match self {
+                ResultRelay::Open { instance_size, .. } => instance_size,
+                ResultRelay::Closed { instance_size, .. } => instance_size,
+            };
+
+            let recvd_size = match size_ref {
+                Either::Left(recv) => recv.await,
+                Either::Right(sz) => return Some(*sz),
+            };
+
+            if let Ok(sz) = recvd_size {
+                *size_ref = Either::Right(sz);
+                Some(sz)
+            } else {
+                self.close().await;
+                None
+            }
+        }
+
+        async fn recv(&mut self) -> Option<Res> {
+            let recv_ref = match self {
+                ResultRelay::Open { result_output, .. } => result_output,
+                ResultRelay::Closed { result_output, .. } => result_output,
+            };
+
+            if let Some(res) = recv_ref.recv().await {
+                Some(res)
+            } else {
+                self.close().await;
+                None
+            }
+        }
+
+        async fn close(&mut self) {
+            // Turn our `self` reference into a reference to `MaybeUninit<Self>`.
+            fn transmute_uninit<T>(x: &mut T) -> &mut MaybeUninit<T> {
+                unsafe { mem::transmute(x) }
+            }
+            let self_uninit = transmute_uninit(self);
+
+            // Take the current value out of self.
+            let self_value = mem::replace(self_uninit, MaybeUninit::uninit());
+
+            // Perform the actual close operation. This statment is not allowed to panic or return
+            // because the `self` reference does not contain a valid value at this point.
+            let (closed_value, relay_panic) = match unsafe { self_value.assume_init() } {
+                ResultRelay::Open {
+                    relay_handle,
+                    result_output,
+                    instance_size,
+                } => {
+                    let relay_res = relay_handle.await;
+                    (
+                        ResultRelay::Closed {
+                            result_output,
+                            instance_size,
+                        },
+                        relay_res
+                            .err()
+                            .filter(|e| e.is_panic())
+                            .map(|e| e.into_panic()),
+                    )
+                }
+                closed @ ResultRelay::Closed { .. } => (closed, None),
+            };
+
+            // Put a valid value back into `self`.
+            _ = mem::replace(self_uninit, MaybeUninit::new(closed_value));
+
+            // If the relay thread panicked, pass the panic on.
+            if let Some(panic_payload) = relay_panic {
+                std::panic::resume_unwind(panic_payload)
+            }
+        }
     }
 
     /// Represents the connection to a running solver process.
     pub struct Solver {
+        tag: Tag,
         child_handle: process::Child,
-        relay_handle: JoinHandle<()>,
-        event_output: UnboundedReceiver<Event>,
-        instance_size_recv: oneshot::Receiver<i64>,
+        child_input: BufWriter<process::ChildStdin>,
+        result_relay: ResultRelay,
+    }
+
+    impl Solver {
+        pub fn name(&self) -> &'static str {
+            cmd::args().solver_name(self.tag)
+        }
+
+        fn relay_closed_error(&self) -> color_eyre::Report {
+            eyre!("Solver {} closed communcation unexpectedly", self.name())
+        }
+
+        pub async fn instance_size(&mut self) -> Result<u64> {
+            self.result_relay
+                .instance_size()
+                .await
+                .ok_or_else(|| self.relay_closed_error())
+                .wrap_err("Instance size not communicated")
+        }
+
+        async fn write_challenge<T: Borrow<Lit> + ToString>(
+            &mut self,
+            assumptions: impl IntoIterator<Item = T>,
+        ) -> io::Result<()> {
+            self.child_input.write_u8(b's').await?;
+            for lit in assumptions {
+                self.child_input.write_u8(b' ').await?;
+                self.child_input
+                    .write_all(lit.to_string().as_bytes())
+                    .await?;
+            }
+            self.child_input.write_u8(b'\n').await?;
+            self.child_input.flush().await?;
+            Ok(())
+        }
+
+        async fn read_event(&mut self) -> Result<Res> {
+            self.result_relay
+                .recv()
+                .await
+                .ok_or_else(|| self.relay_closed_error())
+        }
+
+        pub async fn run_challenge<T: Borrow<Lit> + ToString>(
+            &mut self,
+            assumptions: impl IntoIterator<Item = T>,
+        ) -> Result<Res> {
+            // Send the challenge.
+            self.write_challenge(assumptions)
+                .await
+                .wrap_err("failed to send challenge to solver process")?;
+
+            // Wait for the answer.
+            self.read_event()
+                .await
+                .wrap_err("no answer to solve request")
+        }
+
+        pub async fn terminate(mut self) -> Result<ExitStatus> {
+            // We destroy `self` by moving parts out. Extract the name for a later error message as
+            // long as it's this simple.
+            let name = self.name();
+
+            // Terminate the child process and close the result relay.
+            let (exit, _) = tokio::join!(
+                Self::terminate_impl(self.name(), self.child_handle, self.child_input),
+                self.result_relay.close()
+            );
+
+            // Return the (potentially failed) process exit information.
+            exit.wrap_err_with(|| format!("Failed to terminate the solver process {name}"))
+        }
+
+        async fn terminate_impl<ChildInput>(
+            name: &str,
+            mut child: process::Child,
+            input: ChildInput,
+        ) -> Result<ExitStatus> {
+            // There are multiple ways we could implement termination.
+            //
+            //     (1)  send SIGKILL using `Child::kill`
+            //     (2)  send `q` over stdin and `CHILD::wait`
+            //     (3)  close STDIN and expect the child to terminate automatically.
+            //
+            // Below we use a combination of (1) and (3): We close STDIN and give the child process
+            // a grace period of `TERMINATION_TIMEOUT` after which we send SIGKILL.
+
+            // To avoid unnecessary verbose messages in case the solver already terminated we check
+            // with the non-blocking `child_handle.try_wait()` first.
+            if let Some(exit) = child.try_wait()? {
+                return Ok(exit);
+            }
+
+            const TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+            let verbose = cmd::args().verbose();
+            if verbose {
+                eprintln!("terminating solver {name}")
+            }
+
+            // Send EOF by dropping the input handle.
+            drop(input);
+
+            // Give the child a timeout of 1s to terminate gracefully.
+            tokio::select! {
+                r = child.wait() => return Ok(r?),
+                _ = tokio::time::sleep(TERMINATION_TIMEOUT) => {}
+            };
+
+            if verbose {
+                eprintln!(
+                    "solver took longer than {}s to terminate ... killing",
+                    TERMINATION_TIMEOUT.as_secs_f64()
+                );
+            }
+
+            // We "want" the exit code even if we kill the process but `Child::kill` does not
+            // return any information. Therefore, we use a combination of `Child::start_kill` and
+            // `Child::wait`.
+            child.start_kill()?;
+            Ok(child.wait().await?)
+        }
+    }
+
+    fn annotate_with_solver_launch(tag: Tag) -> impl Fn(color_eyre::Report) -> color_eyre::Report {
+        move |err| {
+            err.note("solver process spawned as")
+                .note("")
+                .note(format!("  {:?}", cmd::args().solver_cmd(tag)))
+                .note("")
+        }
     }
 
     pub fn launch(tag: Tag) -> Result<Solver> {
-        // Build command as a std command because it supports formatting as shell-like output.
-        let mut cmd = std::process::Command::new(cmd::args().solver_exe(tag));
-        cmd.args(&cmd::args().solver_args);
-        if cmd::args().verbose {
-            println!("launching solver {tag}\n  {:?}", cmd);
+        let args = cmd::args();
+        let cmd = args.solver_cmd(tag);
+        if args.verbose() {
+            eprintln!("launching solver {}:  {:?}", args.solver_name(tag), cmd);
         }
 
         // Convert to a tokio command before executing.
@@ -173,56 +553,47 @@ mod solver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .wrap_err_with(|| format!("Failed to launch solver {}", cmd::args().solver_name(tag)))
+            .map_err(annotate_with_solver_launch(tag))?;
 
         // Create channels for interaction.
-        let (event_send, event_output) = unbounded_channel();
+        let (result_send, result_output) = channel(1);
         let (instance_size_send, instance_size_recv) = oneshot::channel();
 
         // Spawn the relaying thread.
         let relay_handle =
-            start_output_relay(tag, &mut child_handle, event_send, instance_size_send);
+            start_output_relay(tag, &mut child_handle, result_send, instance_size_send);
+
+        let child_input = child_handle.stdin.take().expect("input not piped");
+        let child_input = BufWriter::new(child_input);
 
         // Return the solver instance.
         Ok(Solver {
+            tag,
             child_handle,
-            relay_handle,
-            event_output,
-            instance_size_recv,
+            child_input,
+            result_relay: ResultRelay::Open {
+                relay_handle,
+                result_output,
+                instance_size: Either::Left(instance_size_recv),
+            },
         })
     }
 
     fn start_output_relay(
         tag: Tag,
         process: &mut process::Child,
-        event_output: UnboundedSender<Event>,
-        size_output: oneshot::Sender<i64>,
+        result_output: Sender<Res>,
+        size_output: oneshot::Sender<u64>,
     ) -> JoinHandle<()> {
-        let out = process
-            .stdout
-            .take()
-            .ok_or_else(|| {
-                eyre!(
-                    "output not piped from solver {}",
-                    cmd::args().solver_name(tag)
-                )
-            })
-            .unwrap();
-        let err = process
-            .stderr
-            .take()
-            .ok_or_else(|| {
-                eyre!(
-                    "output not piped from solver {}",
-                    cmd::args().solver_name(tag)
-                )
-            })
-            .unwrap();
+        let out = process.stdout.take().expect("output not piped");
+        let err = process.stderr.take().expect("output not piped");
         tokio::spawn(async move {
             let name = cmd::args().solver_name(tag);
             _ = tokio::join!(
                 // stdout is parsed.
-                ProcessingRelay::new(event_output, size_output).relay_output(&name, out),
+                ProcessingRelay::new(result_output, size_output).relay_output(&name, out),
                 // stderr is not parsed but simply relayed.
                 UnfilteredRelay.relay_output(&name, err),
             )
@@ -297,14 +668,14 @@ mod solver {
     }
 
     struct ProcessingRelay {
-        event_output: UnboundedSender<Event>,
-        size_output: Option<oneshot::Sender<i64>>,
+        result_output: Sender<Res>,
+        size_output: Option<oneshot::Sender<u64>>,
     }
 
     impl ProcessingRelay {
-        fn new(event_output: UnboundedSender<Event>, size_output: oneshot::Sender<i64>) -> Self {
+        fn new(result_output: Sender<Res>, size_output: oneshot::Sender<u64>) -> Self {
             ProcessingRelay {
-                event_output,
+                result_output,
                 size_output: Some(size_output),
             }
         }
@@ -334,7 +705,7 @@ mod solver {
                     let None = components.next() else {
                         return Err("not interpreted as a SIZE answer (additional content)");
                     };
-                    let Some(n) = parse_slice::<i64>(n) else {
+                    let Some(n) = parse_slice::<u64>(n) else {
                         return Err("not interpreted as a SIZE answer (can't parse number)");
                     };
                     let Some(size_chan) = self.size_output.take() else {
@@ -348,19 +719,19 @@ mod solver {
                     let None = components.next() else {
                         return Err("not interpreted as SAT answer (additional content)");
                     };
-                    _ = self.event_output.send(Event::Sat);
+                    _ = self.result_output.send(Res::Sat);
                 }
 
                 // UNSAT answer.
                 Some(b"U") => {
                     let Some(conflict) = components
-                        .map(parse_slice::<i64>)
-                        .collect::<Option<Vec<_>>>()
+                        .map(parse_slice)
+                        .collect::<Option<Clause>>()
                     else {
                         return Err("not interpreted as UNSAT answer (failed to parse conflict set)");
                     };
 
-                    _ = self.event_output.send(Event::Unsat(conflict));
+                    _ = self.result_output.send(Res::Unsat(conflict));
                 }
 
                 // not a recognized command, print.
@@ -368,810 +739,391 @@ mod solver {
             }
 
             // Print commands if we are in verbose mode.
-            Ok(cmd::args().verbose)
+            Ok(cmd::args().verbose())
         }
     }
-}
-
-/*
-mod util {
-    use std::future::{self, Future, IntoFuture};
-
-    pub trait ResultEx<T, E> {
-        fn catch(inner: impl FnOnce() -> Result<T, E>) -> Self;
-        fn catch_eventually<F>(inner: F) -> F::IntoFuture
-        where
-            F: IntoFuture<Output = Result<T, E>>;
-    }
-
-    impl<T, E> ResultEx<T, E> for Result<T, E> {
-        fn catch(inner: impl FnOnce() -> Result<T, E>) -> Self {
-            inner()
-        }
-
-    }
-}
-*/
-
-/*
-#![feature(iter_collect_into)]
-
-use std::{
-    ffi::{OsStr, OsString},
-    process::Stdio,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
-
-use clap::Parser;
-use color_eyre::eyre::Result;
-use tokio::{process, sync::mpsc::unbounded_channel};
-
-#[derive(Debug, Parser)]
-struct Args {
-    /// Seed to reproduce results.
-    #[arg(short, long)]
-    seed: Option<u64>,
-
-    /// Print additional output.
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// CNF instance to test with.
-    instance: OsString,
-
-    #[clap(env = "MINISAT_TEST_RUNNER_INSTANCE_A", long)]
-    solver_a: OsString,
-
-    #[clap(env = "MINISAT_TEST_RUNNER_INSTANCE_B", long)]
-    solver_b: OsString,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    color_eyre::install()?;
-
-    let args = Args::parse();
-    let seed = match args.seed {
-        Some(seed) => seed,
-        None => gen_seed()?,
-    };
-
-    println!("Rerun with  --seed={seed}");
-
-    let term_signal = Arc::new(AtomicBool::new(false));
-    let term_signal_copy = term_signal.clone();
-
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install signal handler");
-        term_signal_copy.store(true, Ordering::Relaxed);
-    });
-
-    if args.verbose {
-        println!("launching test instances");
-    }
-
-    let mut a = spawn_instance(&args.solver_a, &args.instance)?;
-    let mut b = spawn_instance(&args.solver_b, &args.instance)?;
-
-    let verbose = args.verbose;
-    let a_in = a.stdin.take().expect("no stdin pipe to A");
-    let a_out = a.stdout.take().expect("no stdout pipe to A");
-    let a_err = a.stderr.take().expect("no stderr pipe to A");
-    let b_in = b.stdin.take().expect("no stdin pipe to B");
-    let b_out = b.stdout.take().expect("no stdout pipe to B");
-    let b_err = b.stderr.take().expect("no stderr pipe to B");
-
-    let (events_out, events_in) = unbounded_channel();
-
-    let stream_relay = tokio::spawn(async move {
-        relay::StreamRelay::new(verbose, a_out, a_err, b_out, b_err)
-            .run(events_out)
-            .await
-    });
-
-    let coordinator = tokio::spawn(async move {
-        coordinator::Coordinator::new(a_in, b_in, events_in, seed, verbose, term_signal)
-            .run()
-            .await
-    });
-
-    coordinator.await??;
-    stream_relay.await??;
-    a.wait().await?;
-    b.wait().await?;
-
-    Ok(())
-}
-
-fn gen_seed() -> Result<u64> {
-    let mut bytes = [0; 8];
-    getrandom::getrandom(&mut bytes)?;
-    Ok(u64::from_ne_bytes(bytes))
-}
-
-fn spawn_instance(exe: &OsStr, cnf_path: &OsStr) -> Result<process::Child> {
-    Ok(process::Command::new(exe)
-        .arg(cnf_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?)
-}
-
-mod comm {
-    use std::fmt;
-
-    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-
-    use crate::util::WriteJoined;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Tag {
-        A,
-        B,
-    }
-
-    impl fmt::Display for Tag {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Tag::A => write!(f, "A"),
-                Tag::B => write!(f, "B"),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum Event {
-        SAT,
-        UNSAT(Vec<i32>),
-        LOADED(usize),
-    }
-
-    impl fmt::Display for Event {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Event::SAT => write!(f, "SAT"),
-                Event::UNSAT(confl) => write!(f, "UNSAT {}", WriteJoined::by_space(confl)),
-                Event::LOADED(n) => write!(f, "LOADED {n}"),
-            }
-        }
-    }
-
-    pub type EventsSend = UnboundedSender<(Tag, Event)>;
-    pub type EventsRecv = UnboundedReceiver<(Tag, Event)>;
 }
 
 mod coordinator {
-    use std::{
-        io::{self, Write},
-        sync::{atomic::AtomicBool, Arc},
-    };
-
-    use color_eyre::{
-        eyre::{eyre, Context},
-        Result,
-    };
-    use ndhistogram::{
-        axis::{BinInterval, UniformNoFlow},
-        ndhistogram, Histogram,
-    };
-    use patricia_tree::PatriciaSet;
-    use rand::{prelude::Distribution, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
-    use tokio::{
-        io::{AsyncWriteExt, BufWriter},
-        process,
-    };
-
-    use crate::{
-        comm::{Event, EventsRecv, Tag},
-        util::{Sorted, WriteJoined},
-    };
-
-    struct Data {
-        a: BufWriter<process::ChildStdin>,
-        b: BufWriter<process::ChildStdin>,
-        events: EventsRecv,
-        stop_flag: Arc<AtomicBool>,
-        verbose: bool,
-    }
-
-    #[must_use]
-    pub struct Coordinator(Data, u64);
-
-    impl Coordinator {
-        pub fn new(
-            a: process::ChildStdin,
-            b: process::ChildStdin,
-            events: EventsRecv,
-            rng_seed: u64,
-            verbose: bool,
-            stop_flag: Arc<AtomicBool>,
-        ) -> Self {
-            Coordinator(
-                Data {
-                    a: BufWriter::new(a),
-                    b: BufWriter::new(b),
-                    events,
-                    verbose,
-                    stop_flag,
-                },
-                rng_seed,
-            )
-        }
-
-        pub async fn run(mut self) -> Result<()> {
-            while let Some((tag, ev)) = self.0.events.recv().await {
-                if let Event::LOADED(n) = ev {
-                    return self.make_sized(n).run().await;
-                }
-
-                println!("* ignoring early event from {tag}: {ev}");
-            }
-
-            Err(eyre!("instance did not load"))
-        }
-
-        fn make_sized(self, size: usize) -> SizedCoordinator {
-            let max_assump_size = if size < 5 { size } else { size * 2 / 3 };
-            let hist_steps = if size / 16 <= 1 { size } else { 16 };
-            SizedCoordinator {
-                data: self.0,
-                rng: SmallRng::seed_from_u64(self.1),
-                var_count: size as i32,
-                count_distrib: rand::distributions::Uniform::new(1, max_assump_size),
-                chosen_sizes: ndhistogram!(
-                    UniformNoFlow::with_step_size(hist_steps, 1, (size / 16) + 1);
-                    usize
-                ),
-                sat_challenges: PatriciaSet::new(),
-                encoded_challenge: Vec::new(),
-            }
-        }
-    }
-
-    #[must_use]
-    struct SizedCoordinator {
-        data: Data,
-        rng: SmallRng,
-        var_count: i32,
-        count_distrib: rand::distributions::Uniform<usize>,
-        chosen_sizes: ndhistogram::Hist1D<UniformNoFlow<usize>, usize>,
-        /// Stores the challenges which resulted in SAT. We don't have to spend time on rechecking
-        /// subsets of these.
-        sat_challenges: PatriciaSet,
-        encoded_challenge: Vec<u8>,
-    }
-
-    impl SizedCoordinator {
-        async fn run(mut self) -> Result<()> {
-            let mut i = 1 as usize;
-
-            while !self
-                .data
-                .stop_flag
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                println!("{:=>80}", format!(" {i}"));
-                i += 1;
-
-                let challenge = self.select_challenge()?;
-                self.perform_challenge(challenge).await?;
-            }
-
-            Ok(())
-        }
-
-        fn select_challenge(&mut self) -> Result<Sorted<i32>> {
-            for tryn in 0..50 {
-                if self.data.verbose && tryn > 0 && tryn % 5 == 0 {
-                    println!("* retrying challenge generation #{tryn}");
-                }
-
-                // Choose size.
-                let size = self.count_distrib.sample(&mut self.rng);
-
-                // Choose actual inhabitants.
-                let mut vars = (1..=self.var_count).choose_multiple(&mut self.rng, size);
-
-                // For each variable decide if it should appear negated.
-                for v in vars.iter_mut() {
-                    if self.rng.gen() {
-                        *v = *v * -1;
-                    }
-                }
-
-                let vars = Sorted::new(vars);
-
-                // Check that it isn't a challenge which would result in SAT anyways.
-                self.encode_challenge(&vars);
-                if self
-                    .sat_challenges
-                    .iter_prefix(&self.encoded_challenge)
-                    .next()
-                    .is_none()
-                {
-                    // Return challenge.
-                    return Ok(vars);
-                }
-            }
-
-            Err(eyre!("failed to generate a new challenge after 50 tries"))
-        }
-
-        fn encode_challenge(&mut self, challenge: &[i32]) {
-            self.encoded_challenge.clear();
-            if self.var_count <= i8::MAX as i32 {
-                challenge
-                    .iter()
-                    .map(|&v| v as u8)
-                    .collect_into(&mut self.encoded_challenge);
-            } else if self.var_count <= i16::MAX as i32 {
-                challenge
-                    .iter()
-                    .flat_map(|&v| (v as i16).to_le_bytes())
-                    .collect_into(&mut self.encoded_challenge);
-            } else {
-                challenge
-                    .iter()
-                    .flat_map(|&v| v.to_le_bytes())
-                    .collect_into(&mut self.encoded_challenge);
-            }
-        }
-
-        async fn send_challenge(&mut self, tag: Tag, challenge: &[i32]) -> Result<()> {
-            let handle = match tag {
-                Tag::A => &mut self.data.a,
-                Tag::B => &mut self.data.b,
-            };
-
-            handle.write_u8(b's').await?;
-            for v in challenge {
-                handle.write_u8(b' ').await?;
-                handle.write_all(v.to_string().as_bytes()).await?;
-            }
-            handle.write_u8(b'\n').await?;
-            handle.flush().await?;
-            Ok(())
-        }
-
-        async fn read_challenge_answer(&mut self) -> Result<(Option<Vec<i32>>, Option<Vec<i32>>)> {
-            let mut a_res: Option<Result<(), Vec<i32>>> = None;
-            let mut b_res: Option<Result<(), Vec<i32>>> = None;
-
-            while let Some(ev) = self.data.events.recv().await {
-                match ev {
-                    (Tag::A, Event::SAT) => a_res = Some(Ok(())),
-                    (Tag::B, Event::SAT) => b_res = Some(Ok(())),
-                    (Tag::A, Event::UNSAT(confl)) => a_res = Some(Err(confl)),
-                    (Tag::B, Event::UNSAT(confl)) => b_res = Some(Err(confl)),
-                    (_, Event::LOADED(_)) => {}
-                }
-
-                if a_res.is_some() && b_res.is_some() {
-                    break;
-                }
-            }
-
-            match (a_res, b_res) {
-                (None, None) | (Some(_), None) | (None, Some(_)) => {
-                    Err(eyre!("missing challenge results from A/B"))
-                }
-                (Some(res_a), Some(res_b)) => Ok((res_a.err(), res_b.err())),
-            }
-        }
-
-        async fn perform_challenge(&mut self, assumptions: Sorted<i32>) -> Result<()> {
-            println!(
-                "Challenging with {} {}",
-                assumptions.len(),
-                if assumptions.len() == 1 {
-                    "assumption"
-                } else {
-                    "assumptions"
-                }
-            );
-            if self.data.verbose {
-                println!("  {}", WriteJoined::by_space(&assumptions))
-            }
-
-            self.chosen_sizes.fill(&assumptions.len());
-            self.show_histogram()?;
-
-            // Send challange.
-            self.send_challenge(Tag::A, &assumptions)
-                .await
-                .wrap_err("failed to send solve request to A")?;
-            self.send_challenge(Tag::B, &assumptions)
-                .await
-                .wrap_err("failed to send solve request to B")?;
-
-            // Wait for results.
-            let result = self
-                .read_challenge_answer()
-                .await
-                .wrap_err("an error occured while waiting for the challenge result")?;
-            let (a_confl, b_confl) = match result {
-                (None, None) => {
-                    println!("=> SAT");
-                    self.sat_challenges.insert(&self.encoded_challenge);
-                    return Ok(());
-                }
-
-                (Some(mut a_confl), Some(mut b_confl)) => {
-                    for x in a_confl.iter_mut().chain(b_confl.iter_mut()) {
-                        *x = -*x;
-                    }
-
-                    let xs = Sorted::new(a_confl);
-                    let ys = Sorted::new(b_confl);
-                    let m = xs.len();
-                    let n = ys.len();
-
-                    // Check for a trivial equivalence in which case we can save some computation
-                    // time and move on to the next test case.
-                    if m == n {
-                        if xs == ys {
-                            println!("=> UNSAT, same conflict clauses");
-                            return Ok(());
-                        }
-                    }
-
-                    println!("UNSAT, {m} vs {n}");
-                    (xs, ys)
-                }
-
-                (None, Some(_)) | (Some(_), None) => {
-                    return Err(eyre!("SAT/UNSAT conflict!"));
-                }
-            };
-
-            // Check that the conflicts
-            //  (1) are a subset of the challenge
-            //  (2) result in UNSAT in the other instance
-            if !a_confl.is_subset_of(&assumptions) {
-                return Err(eyre!(
-                    concat!(
-                        "conflict from A not a subset of the assumptions\n",
-                        "  assumptions: {}\n",
-                        "     conflict: {}"
-                    ),
-                    WriteJoined::by_space(&assumptions),
-                    WriteJoined::by_space(&a_confl),
-                ));
-            }
-            if !b_confl.is_subset_of(&assumptions) {
-                return Err(eyre!(
-                    concat!(
-                        "conflict from B not a subset of the assumptions\n",
-                        "  assumptions: {}\n",
-                        "     conflict: {}"
-                    ),
-                    WriteJoined::by_space(&assumptions),
-                    WriteJoined::by_space(&b_confl),
-                ));
-            }
-
-            // Dispatch renewed challenges for (2).
-            self.send_challenge(Tag::A, &b_confl)
-                .await
-                .wrap_err("failed to send check-request to A")?;
-            self.send_challenge(Tag::B, &a_confl)
-                .await
-                .wrap_err("failed to send check-request to B")?;
-
-            // Wait for check results.
-            let (a_res, b_res) = self
-                .read_challenge_answer()
-                .await
-                .wrap_err("an error occured while waiting for the re-check result")?;
-
-            if a_res.is_none() {
-                return Err(eyre!(
-                    concat!(
-                        "conflict returned by B is not a conflict in A\n",
-                        "    assumptions: {}\n",
-                        "  conflict by B: {}",
-                    ),
-                    WriteJoined::by_space(&assumptions),
-                    WriteJoined::by_space(&b_confl),
-                ));
-            }
-            if b_res.is_none() {
-                return Err(eyre!(
-                    concat!(
-                        "conflict returned by A is not a conflict in B\n",
-                        "    assumptions: {}\n",
-                        "  conflict by A: {}",
-                    ),
-                    WriteJoined::by_space(&assumptions),
-                    WriteJoined::by_space(&a_confl),
-                ));
-            }
-
-            Ok(())
-        }
-
-        fn show_histogram(&self) -> io::Result<()> {
-            // Pre-format labels for aligned output
-            let labels = self
-                .chosen_sizes
-                .iter()
-                .filter_map(|bucket| {
-                    let BinInterval::Bin { start, end } = bucket.bin else {
-                        return None
-                    };
-                    Some(if start + 1 == end {
-                        start.to_string()
-                    } else {
-                        format!("{start}-{end}", end = end - 1)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let label_length = labels.iter().map(|lbl| lbl.len()).max().unwrap_or(0);
-
-            // Normalize widths to a max of 80 columns.
-            let max_widths = self.chosen_sizes.values().copied().max().unwrap_or(0);
-            let norm_factor = if max_widths <= 80 {
-                1.0
-            } else {
-                80.0 / (max_widths as f64)
-            };
-
-            // Output histogram.
-            let mut out = io::stdout().lock();
-            for (label, bucket) in std::iter::zip(labels, self.chosen_sizes.into_iter()) {
-                let n = (*bucket.value as f64 * norm_factor) as usize;
-                writeln!(out, "{label:>label_length$} {:*<n$}", "")?;
-            }
-
-            Ok(())
-        }
-    }
-}
-
-mod relay {
-    use std::io;
+    use std::fmt;
 
     use color_eyre::Result;
-    use tokio::{
-        io::{AsyncBufRead, AsyncBufReadExt, BufReader},
-        process,
+    use sorted_vec::SortedSet;
+    use these::These;
+
+    use crate::{
+        cmd,
+        solver::{Clause, ClauseRef, Lit, Res, Solver},
+        util::{Joined, MergeErrors, MergeThese},
     };
 
-    use crate::comm::{Event, EventsSend, Tag};
-
-    #[must_use]
-    pub struct StreamRelay {
-        verbose: bool,
-        is_eof: [bool; 4],
-        buffers: [Vec<u8>; 4],
-        readers: [Box<dyn AsyncBufRead + Send + std::marker::Unpin>; 4],
+    /// Describes a detected failure.
+    #[derive(Debug)]
+    pub struct Failure {
+        /// Seed used to generate the set of assumptions which lead to the failure.
+        seed: Option<u64>,
+        /// Set of assumptions which lead to the error.
+        assumptions: Clause,
+        /// Describes the failure that occured.
+        mode: FailureMode,
     }
 
-    impl StreamRelay {
-        pub fn new(
-            verbose: bool,
-            a_out: process::ChildStdout,
-            a_err: process::ChildStderr,
-            b_out: process::ChildStdout,
-            b_err: process::ChildStderr,
-        ) -> Self {
-            StreamRelay {
-                verbose,
-                is_eof: [false; 4],
-                buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-                readers: [
-                    Box::new(BufReader::new(a_out)),
-                    Box::new(BufReader::new(a_err)),
-                    Box::new(BufReader::new(b_out)),
-                    Box::new(BufReader::new(b_err)),
-                ],
-            }
-        }
+    /// Describes the kind of detected failure.
+    #[derive(Debug)]
+    pub enum FailureMode {
+        /// Solver A returned a SAT result while solver B returned an UNSAT result and the
+        /// contained conflict clause.
+        SatUnsat { b_conflict: Clause },
 
-        const TAGS: [Tag; 4] = [Tag::A, Tag::A, Tag::B, Tag::B];
+        /// Solver B returned a SAT result while solver A returned an UNSAT result and the
+        /// contained conflict clause.
+        UnsatSat { a_conflict: Clause },
 
-        fn parse_line(
-            verbose: bool,
-            line: &str,
-        ) -> Result<(bool, &'static str, Option<Event>), &'static str> {
-            let mut parts = line.split_ascii_whitespace();
-            let (ev, consumed) = match parts.next() {
-                Some("c") | None => return Ok((false, "", None)),
-                Some("n") => {
-                    let Some(nstr) = parts.next() else {
-                        return Err("bad `n` response");
-                    };
-                    let Ok(n) = nstr.parse() else {
-                        return Err("bad `n` response");
-                    };
-                    (Event::LOADED(n), parts.next().is_none())
+        /// The conflict clause returned by `origin` is not a conflict clause at all. The
+        /// `These::This` variant indicates a faulty conflict clause from solver A, `These::That`
+        /// indicates a faulty conflict clause by solver B, and `These::Both` indicates that no
+        /// solver produced a conflict clause which is valid in the other one.
+        NoConflict { clauses: These<Clause, Clause> },
+        // The solver with the specified tag exited unexpectedly.
+        //SolverTerminated { tag: Tag, code: ExitStatus },
+    }
+
+    pub type OrderedClause = SortedSet<Lit>;
+
+    impl fmt::Display for Failure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            writeln!(f, "{:-^79}", " FAILED ")?;
+
+            writeln!(f)?;
+            writeln!(f, "assumptions: {}", self.assumptions.joined())?;
+
+            let args = cmd::args();
+            match &self.mode {
+                FailureMode::SatUnsat { b_conflict } => {
+                    writeln!(f)?;
+                    writeln!(f, "Solver {} reports   SAT", args.name_a)?;
+                    writeln!(f, "Solver {} reports UNSAT", args.name_b)?;
+                    writeln!(f, "  conflict clause: {}", b_conflict.joined())?;
                 }
-                Some("S") => (Event::SAT, parts.next().is_none()),
-                Some("U") => {
-                    let Some(confl) = parts.map(|s| s.parse().ok()).collect::<Option<Vec<_>>>() else {
-                        return Err("bad `U` response");
-                    };
-                    (Event::UNSAT(confl), true)
+                FailureMode::UnsatSat { a_conflict } => {
+                    writeln!(f)?;
+                    writeln!(f, "Solver {} reports UNSAT", args.name_a)?;
+                    writeln!(f, "  conflict clause: {}", a_conflict.joined())?;
+                    writeln!(f, "Solver {} reports   SAT", args.name_b)?;
                 }
-                Some("r") => return Ok((verbose, "", None)),
-                Some(_) => return Ok((true, "", None)),
-            };
-
-            if consumed {
-                Ok((verbose, "", Some(ev)))
-            } else {
-                Ok((true, "interpreting overfull response as command", Some(ev)))
-            }
-        }
-
-        fn handle_line(&mut self, events: &EventsSend, index: usize) -> Result<()> {
-            let buf = &mut self.buffers[index];
-            let full_line = String::from_utf8_lossy(buf);
-            let ln = full_line.trim_end();
-            let opt_ev = match Self::parse_line(self.verbose, &ln) {
-                Ok((print, warn, opt_ev)) => {
-                    if print && !warn.is_empty() {
-                        println!("{}> {ln}\n[warning: {warn}]", Self::TAGS[index]);
-                    } else if print {
-                        println!("{}> {ln}", Self::TAGS[index]);
+                FailureMode::NoConflict { clauses } => {
+                    if let Some(a_confl) = clauses.as_ref().here() {
+                        writeln!(f)?;
+                        writeln!(f, "Bad conflict reported by solver {}", args.name_a)?;
+                        writeln!(f, "  conflict clause: {}", a_confl.joined())?;
                     }
-                    opt_ev
+                    if let Some(b_confl) = clauses.as_ref().there() {
+                        writeln!(f)?;
+                        writeln!(f, "Bad conflict reported by solver {}", args.name_b)?;
+                        writeln!(f, "  conflict clause: {}", b_confl.joined())?;
+                    }
                 }
-                Err(msg) => {
-                    println!("{}> {ln}\n[error: {msg}, skipping]", Self::TAGS[index]);
+            }
+
+            writeln!(f)?;
+            write!(f, "* use  --assume=")?;
+            if self.assumptions.is_empty() {
+                write!(f, "\"\"")?;
+            } else {
+                write!(f, "{}", self.assumptions.joined_by(','))?;
+            }
+            writeln!(f, "  to rerun this test case")?;
+            if let Some(seed) = self.seed {
+                writeln!(
+                    f,
+                    "* use  --seed={seed}  to rerun the complete sequence of test cases"
+                )?;
+            }
+
+            writeln!(f)?;
+            writeln!(f, "{:->80}", "")?;
+
+            Ok(())
+        }
+    }
+
+    pub struct ChallengeCoordinator<'s> {
+        challenge_index: u32,
+        solver_a: &'s mut Solver,
+        solver_b: &'s mut Solver,
+    }
+
+    impl<'s> ChallengeCoordinator<'s> {
+        pub fn new(solver_a: &'s mut Solver, solver_b: &'s mut Solver) -> Self {
+            ChallengeCoordinator {
+                challenge_index: 0,
+                solver_a,
+                solver_b,
+            }
+        }
+
+        pub async fn run_challenge(&mut self, challenge: ClauseRef<'_>) -> Result<Option<Failure>> {
+            self.challenge_index += 1;
+
+            print!(
+                concat_lines!("{}{:=>79}", "assumptions: {}"),
+                if self.challenge_index > 1 { "\n\n" } else { "" },
+                format_args!(" {}", self.challenge_index),
+                challenge.joined()
+            );
+
+            let res = tokio::join!(
+                self.solver_a.run_challenge(challenge),
+                self.solver_b.run_challenge(challenge)
+            )
+            .merge_errors("Multiple errors occured.")?;
+
+            match res {
+                (Res::Sat, Res::Sat) => Ok(None),
+                (Res::Unsat(a), Res::Unsat(b)) => self.verify_conflicts(challenge, a, b).await,
+                (Res::Sat, Res::Unsat(b_conflict)) => Ok(Some(Failure {
+                    seed: None,
+                    assumptions: challenge.to_vec(),
+                    mode: FailureMode::SatUnsat { b_conflict },
+                })),
+                (Res::Unsat(a_conflict), Res::Sat) => Ok(Some(Failure {
+                    seed: None,
+                    assumptions: challenge.to_vec(),
+                    mode: FailureMode::UnsatSat { a_conflict },
+                })),
+            }
+        }
+
+        async fn verify_conflicts(
+            &mut self,
+            challenge: ClauseRef<'_>,
+            confl_a: impl Into<OrderedClause>,
+            confl_b: impl Into<OrderedClause>,
+        ) -> Result<Option<Failure>> {
+            let args = cmd::args();
+            let confl_a = confl_a.into();
+            let confl_b = confl_b.into();
+
+            if confl_a == confl_b {
+                print!(
+                    concat_lines!(
+                        /**/ "",
+                        "reported conflict clauses are the same",
+                        "  {}"
+                    ),
+                    confl_a.joined()
+                );
+                return Ok(None);
+            }
+
+            print!(
+                concat_lines!(
+                    /**/ "",
+                    "reported conflict clauses",
+                    "  {}: {}",
+                    "  {}: {}"
+                ),
+                args.name_a,
+                confl_a.joined(),
+                args.name_b,
+                confl_b.joined()
+            );
+
+            fn bad_conflict(res: Res, clause: Clause) -> Option<Clause> {
+                if res.is_sat() {
+                    Some(clause)
+                } else {
                     None
                 }
+            }
+
+            let wrap_failure = |mode| Failure {
+                seed: None,
+                assumptions: challenge.to_vec(),
+                mode,
             };
 
-            buf.clear();
+            let failure = if let Some(trusted) = args.trusted_solver {
+                print!(
+                    concat_lines!(
+                        //
+                        "",
+                        "verifying {}'s conflict using {}"
+                    ),
+                    args.solver_name(trusted.other()),
+                    args.solver_name(trusted)
+                );
 
-            if let Some(ev) = opt_ev {
-                // Ignore any errors/discard untrasmittable events.
-                _ = events.send((Self::TAGS[index], ev));
-            }
-
-            Ok(())
-        }
-
-        fn process_result(
-            &mut self,
-            events: &EventsSend,
-            result: io::Result<usize>,
-            index: usize,
-        ) -> Result<()> {
-            match result {
-                Ok(0) => self.is_eof[index] = true,
-                Ok(_) => self.handle_line(events, index)?,
-                Err(e) => {
-                    self.is_eof[index] = true;
-                    for ln in e.to_string().lines() {
-                        println!("{}> {ln}", Self::TAGS[index])
-                    }
-                }
-            }
-
-            Ok(())
-        }
-
-        async fn try_read(
-            is_eof: bool,
-            reader: &mut (impl AsyncBufRead + std::marker::Unpin),
-            buffer: &mut Vec<u8>,
-        ) -> io::Result<usize> {
-            if is_eof {
-                tokio::task::yield_now().await;
-                Ok(0)
+                let trusted_solver = trusted.select(&mut self.solver_a, &mut self.solver_b);
+                let verified_conflict = trusted.select(confl_b, confl_a);
+                let res = trusted_solver
+                    .run_challenge(verified_conflict.iter())
+                    .await?;
+                bad_conflict(res, verified_conflict.into_vec())
+                    .map(|c| FailureMode::NoConflict {
+                        clauses: trusted.select::<fn(Clause) -> These<Clause, Clause>>(
+                            These::That,
+                            These::This,
+                        )(c),
+                    })
+                    .map(wrap_failure)
             } else {
-                reader.read_until(b'\n', buffer).await
-            }
-        }
+                print!(concat_lines!(
+                    /**/ "",
+                    "verifying clauses against each other"
+                ));
 
-        pub async fn run(&mut self, events: EventsSend) -> Result<()> {
-            while self.is_eof.contains(&false) {
-                let (lo, hi) = self.readers.split_at_mut(2);
-                let (ra, rb) = lo.split_at_mut(1);
-                let (rc, rd) = hi.split_at_mut(1);
-                let (lo, hi) = self.buffers.split_at_mut(2);
-                let (ba, bb) = lo.split_at_mut(1);
-                let (bc, bd) = hi.split_at_mut(1);
-                tokio::select! {
-                    r = Self::try_read(self.is_eof[0], &mut ra[0], &mut ba[0]) => self.process_result(&events, r, 0)?,
-                    r = Self::try_read(self.is_eof[1], &mut rb[0], &mut bb[0]) => self.process_result(&events, r, 1)?,
-                    r = Self::try_read(self.is_eof[2], &mut rc[0], &mut bc[0]) => self.process_result(&events, r, 2)?,
-                    r = Self::try_read(self.is_eof[3], &mut rd[0], &mut bd[0]) => self.process_result(&events, r, 3)?,
-                }
+                let (res_a, res_b) = tokio::join!(
+                    self.solver_a.run_challenge(confl_b.iter()),
+                    self.solver_b.run_challenge(confl_a.iter())
+                )
+                .merge_errors("Multiple errors occured.")?;
+
+                let failed_a = bad_conflict(res_b, confl_a.into_vec());
+                let failed_b = bad_conflict(res_a, confl_b.into_vec());
+                These::merge_these(failed_a, failed_b)
+                    .map(|clauses| FailureMode::NoConflict { clauses })
+                    .map(wrap_failure)
+            };
+
+            if failure.is_none() {
+                println!(
+                    "{} successfully verified!",
+                    if args.trusted_solver.is_some() {
+                        "Conflict"
+                    } else {
+                        "Conflicts"
+                    }
+                );
             }
 
-            Ok(())
+            Ok(failure)
         }
     }
 }
 
 mod util {
-    use core::fmt;
-    use std::ops;
+    use std::fmt::{self, Debug, Display};
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct Sorted<T>(Vec<T>);
+    use color_eyre::{eyre::eyre, owo_colors::OwoColorize, Result, Section, SectionExt};
+    use num_traits::AsPrimitive;
+    use these::These;
 
-    impl<T> Sorted<T> {
-        pub fn new(mut values: Vec<T>) -> Self
-        where
-            T: Ord,
-        {
-            values.sort();
-            Sorted(values)
+    use crate::cmd;
+
+    pub use joined::Joined;
+
+    pub trait DigitCount {
+        /// Counts the numbers of digits. The sign is not included for negative numbers.
+        ///
+        /// The return type is `usize` becasue this is the type expected by `format!` and friends
+        /// for field widhts.
+        fn count_digits(&self) -> usize;
+    }
+
+    impl<T: AsPrimitive<f64>> DigitCount for T {
+        fn count_digits(&self) -> usize {
+            self.as_().abs().log10() as usize + 1
+        }
+    }
+
+    pub trait MergeErrors: Sized {
+        type Merged;
+
+        fn merge_errors<M: Display + Debug + Send + Sync + 'static>(
+            self,
+            msg: M,
+        ) -> Result<Self::Merged> {
+            self.merge_errors_with(|| msg)
         }
 
-        pub fn is_subset_of(&self, full_set: &Sorted<T>) -> bool
-        where
-            T: Eq,
-        {
-            if self.len() < full_set.len() {
-                // continue below
-            } else if self.len() > full_set.len() {
-                return false;
-            } else {
-                return self == full_set;
-            }
+        fn merge_errors_with<M: Display + Debug + Send + Sync + 'static>(
+            self,
+            msg: impl FnOnce() -> M,
+        ) -> Result<Self::Merged>;
+    }
 
-            let mut sub_it = self.iter();
-            let mut full_it = full_set.iter();
+    impl<T, U> MergeErrors for (Result<T>, Result<U>) {
+        type Merged = (T, U);
 
-            'next_subval: while let Some(val) = sub_it.next() {
-                while let Some(full_val) = full_it.next() {
-                    if val == full_val {
-                        continue 'next_subval;
-                    }
+        fn merge_errors_with<M: Display + Debug + Send + Sync + 'static>(
+            self,
+            msg: impl FnOnce() -> M,
+        ) -> Result<Self::Merged> {
+            match self {
+                (Ok(t), Ok(u)) => Ok((t, u)),
+                (Err(e1), Ok(_)) => Err(e1),
+                (Ok(_), Err(e2)) => Err(e2),
+                (Err(e1), Err(e2)) => {
+                    let args = cmd::args();
+                    Err(eyre!(msg())
+                        .section(ErrorSectionHeader(format!("Solver {}", args.name_a)).header(e1))
+                        .section(ErrorSectionHeader(format!("Solver {}", args.name_b)).header(e2)))
                 }
+            }
+        }
+    }
 
-                return false;
+    pub trait MergeThese<This, That>: Sized {
+        fn merge_these(this: Option<This>, that: Option<That>) -> Option<Self>;
+    }
+
+    impl<This, That> MergeThese<This, That> for These<This, That> {
+        fn merge_these(this: Option<This>, that: Option<That>) -> Option<Self> {
+            Some(match (this, that) {
+                (Some(this), Some(that)) => These::Both(this, that),
+                (Some(this), None) => These::This(this),
+                (None, Some(that)) => These::That(that),
+                (None, None) => return None,
+            })
+        }
+    }
+
+    struct ErrorSectionHeader<H>(H);
+
+    impl<H: Display> Display for ErrorSectionHeader<H> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.bright_red().fmt(f)
+        }
+    }
+
+    pub mod joined {
+        use std::{fmt, ops::Deref};
+
+        pub trait Joined<Item>: Deref<Target = [Item]> {
+            fn joined_by<'a, Sep>(&'a self, sep: Sep) -> WriteJoined<'a, Item, Sep> {
+                WriteJoined::new(self, sep)
             }
 
-            return true;
-        }
-    }
-
-    impl<T> ops::Deref for Sorted<T> {
-        type Target = [T];
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    pub struct WriteJoined<'a, T, Sep>(&'a [T], Sep);
-
-    impl<'a, T> WriteJoined<'a, T, char> {
-        pub fn by_space(values: &'a [T]) -> Self {
-            Self::by_char(values, ' ')
+            fn joined<'a>(&'a self) -> WriteJoined<'a, Item, char> {
+                self.joined_by(' ')
+            }
         }
 
-        pub fn by_char(values: &'a [T], char: char) -> Self {
-            WriteJoined(values, char)
-        }
-    }
+        impl<T: Deref<Target = [Item]>, Item> Joined<Item> for T {}
 
-    impl<'a, T: fmt::Display, Sep: fmt::Display> fmt::Display for WriteJoined<'a, T, Sep> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let mut it = self.0.iter();
-            let Some(first) = it.next() else {
+        pub struct WriteJoined<'a, T, Sep>(&'a [T], Sep);
+
+        impl<'a, T, Sep> WriteJoined<'a, T, Sep> {
+            pub fn new(values: &'a [T], sep: Sep) -> Self {
+                WriteJoined(values, sep)
+            }
+        }
+
+        impl<'a, T: fmt::Display, Sep: fmt::Display> fmt::Display for WriteJoined<'a, T, Sep> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut it = self.0.iter();
+                let Some(first) = it.next() else {
                 return Ok(());
             };
 
-            write!(f, "{first}")?;
-            for val in it {
-                write!(f, "{}{val}", self.1)?;
-            }
+                write!(f, "{first}")?;
+                for val in it {
+                    write!(f, "{}{val}", self.1)?;
+                }
 
-            Ok(())
+                Ok(())
+            }
         }
     }
 }
-*/
