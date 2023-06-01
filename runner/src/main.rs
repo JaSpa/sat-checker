@@ -114,11 +114,7 @@ fn print_solver_exit(tag: Tag) -> impl Fn(ExitStatus) {
             return;
         }
 
-        eprintln!(
-            "Solver {} terminated with exit code {}",
-            args.solver_name(tag),
-            exit
-        );
+        eprintln!("Solver {} terminated with {}", args.solver_name(tag), exit);
     }
 }
 
@@ -271,7 +267,9 @@ mod cmd {
 mod solver {
     use std::{
         borrow::Borrow,
-        fmt, io,
+        fmt,
+        fs::write,
+        io::{self, StderrLock},
         mem::{self, MaybeUninit},
         process::{ExitStatus, Stdio},
         str::FromStr,
@@ -603,7 +601,7 @@ mod solver {
     #[async_trait::async_trait]
     trait OutputRelay {
         /// Process the line and decide wether it should be shown to the user.
-        fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str>;
+        async fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str>;
 
         async fn relay_output(
             mut self,
@@ -639,7 +637,7 @@ mod solver {
                 let line = &buf[..=end_idx];
 
                 // Parse the line and decide wether to output.
-                let res = self.process_line(line);
+                let res = self.process_line(line).await;
                 if res == Ok(true) || res.is_err() {
                     let mut out = io::stdout().lock();
                     write!(out, "{}> ", name)
@@ -661,8 +659,9 @@ mod solver {
 
     struct UnfilteredRelay;
 
+    #[async_trait::async_trait]
     impl OutputRelay for UnfilteredRelay {
-        fn process_line(&mut self, _line: &[u8]) -> Result<bool, &'static str> {
+        async fn process_line(&mut self, _line: &[u8]) -> Result<bool, &'static str> {
             Ok(true)
         }
     }
@@ -681,13 +680,16 @@ mod solver {
         }
     }
 
+    #[async_trait::async_trait]
     impl OutputRelay for ProcessingRelay {
-        fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str> {
+        async fn process_line(&mut self, line: &[u8]) -> Result<bool, &'static str> {
             fn parse_slice<T: FromStr>(slice: &[u8]) -> Option<T> {
                 std::str::from_utf8(slice).ok().and_then(|s| s.parse().ok())
             }
 
-            let mut components = line.split(u8::is_ascii_whitespace);
+            let mut components = line
+                .split(u8::is_ascii_whitespace)
+                .filter(|slice| !slice.is_empty());
 
             match components.next() {
                 // Comment/empty line. Skip
@@ -719,7 +721,7 @@ mod solver {
                     let None = components.next() else {
                         return Err("not interpreted as SAT answer (additional content)");
                     };
-                    _ = self.result_output.send(Res::Sat);
+                    _ = self.result_output.send(Res::Sat).await;
                 }
 
                 // UNSAT answer.
@@ -731,7 +733,7 @@ mod solver {
                         return Err("not interpreted as UNSAT answer (failed to parse conflict set)");
                     };
 
-                    _ = self.result_output.send(Res::Unsat(conflict));
+                    _ = self.result_output.send(Res::Unsat(conflict)).await;
                 }
 
                 // not a recognized command, print.
@@ -868,7 +870,7 @@ mod coordinator {
             print!(
                 concat_lines!("{}{:=>79}", "assumptions: {}"),
                 if self.challenge_index > 1 { "\n\n" } else { "" },
-                format_args!(" {}", self.challenge_index),
+                format!(" {}", self.challenge_index),
                 challenge.joined()
             );
 
@@ -1057,8 +1059,14 @@ mod util {
                 (Err(e1), Err(e2)) => {
                     let args = cmd::args();
                     Err(eyre!(msg())
-                        .section(ErrorSectionHeader(format!("Solver {}", args.name_a)).header(e1))
-                        .section(ErrorSectionHeader(format!("Solver {}", args.name_b)).header(e2)))
+                        .section(
+                            format!("{:?}", e1)
+                                .header(ErrorSectionHeader(format!("Solver {}", args.name_a))),
+                        )
+                        .section(
+                            format!("{:?}", e2)
+                                .header(ErrorSectionHeader(format!("Solver {}", args.name_b))),
+                        ))
                 }
             }
         }

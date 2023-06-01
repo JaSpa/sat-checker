@@ -11,8 +11,13 @@ struct Args {
     /// Path to underlying instance in DIMACS format.
     instance: PathBuf,
 
+    /// Enable verbose mode in the minisat solver.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Debug the communication protocol by printing all received commands.
+    #[arg(short, long)]
+    debug: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -45,8 +50,10 @@ fn main() -> io::Result<()> {
         }
 
         // Echo command.
-        println!("r  {}", line.trim_end());
-        io::stdout().flush().expect("stdout broken");
+        if args.debug {
+            println!("r  {}", line.trim_end());
+            io::stdout().flush().expect("stdout broken");
+        }
 
         let parts = line.split_ascii_whitespace().collect::<Vec<_>>();
 
