@@ -12,9 +12,18 @@ color-eyre = "0.6.2"
 either = "1.8.1"
 futures-core = "0.3.28"
 getrandom = "0.2.9"
-ndhistogram = "0.9.0"
 num-traits = "0.2.15"
 rand = { version = "0.8.5", features = ["small_rng"] }
 sorted-vec = "0.8.2"
 these = "2.0.0"
-tokio = { version = "1.28.1", features = ["full"] }
+
+[dependencies.tokio]
+version = "1.28.1"
+features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "sync",
+  "time",
+]
