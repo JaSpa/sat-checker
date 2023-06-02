@@ -1019,7 +1019,7 @@ mod coordinator {
                 let trusted_solver = trusted.select(&mut self.solver_a, &mut self.solver_b);
                 let verified_conflict = trusted.select(confl_b, confl_a);
                 let res = trusted_solver
-                    .run_challenge(verified_conflict.iter())
+                    .run_challenge(verified_conflict.iter().map(|&v| -v))
                     .await?;
                 bad_conflict(res, verified_conflict.into_vec()).map(|c| {
                     Failure::no_conflict(
@@ -1037,8 +1037,8 @@ mod coordinator {
                 ));
 
                 let (res_a, res_b) = tokio::join!(
-                    self.solver_a.run_challenge(confl_b.iter()),
-                    self.solver_b.run_challenge(confl_a.iter())
+                    self.solver_a.run_challenge(confl_b.iter().map(|&v| -v)),
+                    self.solver_b.run_challenge(confl_a.iter().map(|&v| -v))
                 )
                 .merge_errors()?;
 
