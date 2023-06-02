@@ -1,9 +1,11 @@
 use std::{fmt, process::ExitStatus, str::FromStr};
 
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{eyre::WrapErr, Result};
 use futures_core::future::LocalBoxFuture;
 use solver::Solver;
 use util::MergeErrors;
+
+use crate::coordinator::RandomSearch;
 
 macro_rules! concat_lines {
     ($($ln:literal),+ $(,)?) => {
@@ -57,7 +59,7 @@ impl FromStr for Tag {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -82,19 +84,19 @@ async fn with_solvers<R>(
         async { solver_a.terminate().await.map(print_solver_exit(Tag::A)) },
         async { solver_b.terminate().await.map(print_solver_exit(Tag::B)) },
     )
-    .merge_errors("Multiple errors occured while terminating solver processes")?;
+    .merge_errors_msg("Multiple errors occured while terminating solver processes")?;
 
     r
 }
 
 async fn run(a: &mut Solver, b: &mut Solver) -> Result<()> {
     let args = cmd::args();
-    let mut coordinator = coordinator::ChallengeCoordinator::new(a, b);
+    let mut coordinator = coordinator::Coordinator::new(a, b);
 
     // Run every set of specified assumptions.
     for assumptions in args.assume.iter() {
         if let Some(fail) = coordinator.run_challenge(assumptions).await? {
-            println!("{}", fail);
+            println!("{fail}");
         }
     }
 
@@ -104,7 +106,15 @@ async fn run(a: &mut Solver, b: &mut Solver) -> Result<()> {
     }
 
     // Otherwise start the random search.
-    Err(eyre!("random search not yet implemented."))
+    let size = coordinator.size().await?;
+    let (mut searcher, seed) =
+        RandomSearch::new(args.seed, size).wrap_err("failed to initialize random search")?;
+    let mut fail = coordinator.run_search(&mut searcher).await?;
+    fail.push_rerun(format!(
+        "use  --seed={seed}  to rerun the complete sequence"
+    ));
+    println!("{fail}");
+    Ok(())
 }
 
 fn print_solver_exit(tag: Tag) -> impl Fn(ExitStatus) {
@@ -163,7 +173,7 @@ mod cmd {
         /// Note that the size of the test instance is an implicit parameter in generating the
         /// sets of assumptions. Thus varying the size while keeping the seed will result in
         /// different choices.
-        #[arg(long, group = "entrypoint")]
+        #[arg(short, long, group = "entrypoint")]
         pub seed: Option<u64>,
 
         /// Instead of performing a a random search, check a given set of comma or white-space
@@ -267,9 +277,7 @@ mod cmd {
 mod solver {
     use std::{
         borrow::Borrow,
-        fmt,
-        fs::write,
-        io::{self, StderrLock},
+        fmt, io,
         mem::{self, MaybeUninit},
         process::{ExitStatus, Stdio},
         str::FromStr,
@@ -639,7 +647,7 @@ mod solver {
                 // Parse the line and decide wether to output.
                 let res = self.process_line(line).await;
                 if res == Ok(true) || res.is_err() {
-                    let mut out = io::stdout().lock();
+                    let mut out = io::stderr().lock();
                     write!(out, "{}> ", name)
                         .and_then(|_| out.write_all(line))
                         .and_then(|_| writeln!(out))
@@ -749,25 +757,30 @@ mod solver {
 mod coordinator {
     use std::fmt;
 
-    use color_eyre::Result;
+    use color_eyre::{eyre::eyre, eyre::WrapErr, Result};
+    use rand::{
+        distributions::{self, Distribution},
+        rngs::SmallRng,
+        Rng, SeedableRng,
+    };
     use sorted_vec::SortedSet;
     use these::These;
 
     use crate::{
         cmd,
         solver::{Clause, ClauseRef, Lit, Res, Solver},
-        util::{Joined, MergeErrors, MergeThese},
+        util::{DigitCount, Joined, MergeErrors, MergeThese},
     };
 
     /// Describes a detected failure.
     #[derive(Debug)]
     pub struct Failure {
-        /// Seed used to generate the set of assumptions which lead to the failure.
-        seed: Option<u64>,
         /// Set of assumptions which lead to the error.
-        assumptions: Clause,
+        pub assumptions: Clause,
         /// Describes the failure that occured.
-        mode: FailureMode,
+        pub mode: FailureMode,
+        /// Each entry is printed as a way to rerun the solver.
+        pub rerun_options: Vec<String>,
     }
 
     /// Describes the kind of detected failure.
@@ -786,17 +799,41 @@ mod coordinator {
         /// indicates a faulty conflict clause by solver B, and `These::Both` indicates that no
         /// solver produced a conflict clause which is valid in the other one.
         NoConflict { clauses: These<Clause, Clause> },
-        // The solver with the specified tag exited unexpectedly.
-        //SolverTerminated { tag: Tag, code: ExitStatus },
     }
 
-    pub type OrderedClause = SortedSet<Lit>;
+    impl Failure {
+        pub fn new(assumptions: impl Into<Clause>, mode: FailureMode) -> Self {
+            Failure {
+                assumptions: assumptions.into(),
+                mode,
+                rerun_options: Vec::new(),
+            }
+        }
+
+        fn unsat_sat(assumptions: impl Into<Clause>, a_conflict: Clause) -> Self {
+            Self::new(assumptions, FailureMode::UnsatSat { a_conflict })
+        }
+
+        fn sat_unsat(assumptions: impl Into<Clause>, b_conflict: Clause) -> Self {
+            Self::new(assumptions, FailureMode::SatUnsat { b_conflict })
+        }
+
+        fn no_conflict(assumptions: impl Into<Clause>, conflicts: These<Clause, Clause>) -> Self {
+            Self::new(assumptions, FailureMode::NoConflict { clauses: conflicts })
+        }
+
+        pub fn push_rerun(&mut self, rerun: impl Into<String>) {
+            self.rerun_options.push(rerun.into())
+        }
+    }
 
     impl fmt::Display for Failure {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            writeln!(f, "{:-^79}", " FAILED ")?;
+            fn write_border(f: &mut fmt::Formatter, title: &str) -> fmt::Result {
+                writeln!(f, "{title:-^79}")
+            }
 
-            writeln!(f)?;
+            write_border(f, " FAILED ")?;
             writeln!(f, "assumptions: {}", self.assumptions.joined())?;
 
             let args = cmd::args();
@@ -835,41 +872,72 @@ mod coordinator {
                 write!(f, "{}", self.assumptions.joined_by(','))?;
             }
             writeln!(f, "  to rerun this test case")?;
-            if let Some(seed) = self.seed {
-                writeln!(
-                    f,
-                    "* use  --seed={seed}  to rerun the complete sequence of test cases"
-                )?;
+            for rerun in &self.rerun_options {
+                writeln!(f, "* {rerun}")?;
             }
 
-            writeln!(f)?;
-            writeln!(f, "{:->80}", "")?;
-
+            write_border(f, "")?;
             Ok(())
         }
     }
 
-    pub struct ChallengeCoordinator<'s> {
+    pub type OrderedClause = SortedSet<Lit>;
+
+    pub struct Coordinator<'s> {
         challenge_index: u32,
         solver_a: &'s mut Solver,
         solver_b: &'s mut Solver,
     }
 
-    impl<'s> ChallengeCoordinator<'s> {
+    impl<'s> Coordinator<'s> {
         pub fn new(solver_a: &'s mut Solver, solver_b: &'s mut Solver) -> Self {
-            ChallengeCoordinator {
+            Coordinator {
                 challenge_index: 0,
                 solver_a,
                 solver_b,
             }
         }
 
+        pub async fn size(&mut self) -> Result<u64> {
+            let (sz_a, sz_b) =
+                tokio::join!(self.solver_a.instance_size(), self.solver_b.instance_size())
+                    .merge_errors()?;
+
+            if sz_a == sz_b {
+                Ok(sz_a)
+            } else {
+                Err(eyre!(
+                    concat!(
+                        "Solvers reported conflicting sizes:\n",
+                        "  {}: {:>width$}\n",
+                        "  {}: {:>width$}"
+                    ),
+                    self.solver_a.name(),
+                    sz_a,
+                    self.solver_b.name(),
+                    sz_b,
+                    width = sz_a.max(sz_b).count_digits(),
+                ))
+            }
+        }
+
         pub async fn run_challenge(&mut self, challenge: ClauseRef<'_>) -> Result<Option<Failure>> {
+            Ok(self.run_challenge_impl(challenge).await?.err())
+        }
+
+        pub async fn run_challenge_impl(
+            &mut self,
+            challenge: ClauseRef<'_>,
+        ) -> Result<Result<bool, Failure>> {
             self.challenge_index += 1;
 
             print!(
-                concat_lines!("{}{:=>79}", "assumptions: {}"),
-                if self.challenge_index > 1 { "\n\n" } else { "" },
+                concat_lines!(
+                    //
+                    "{}{:=>79}",
+                    "assumptions: {}"
+                ),
+                if self.challenge_index > 1 { "\n" } else { "" },
                 format!(" {}", self.challenge_index),
                 challenge.joined()
             );
@@ -878,21 +946,19 @@ mod coordinator {
                 self.solver_a.run_challenge(challenge),
                 self.solver_b.run_challenge(challenge)
             )
-            .merge_errors("Multiple errors occured.")?;
+            .merge_errors()?;
 
             match res {
-                (Res::Sat, Res::Sat) => Ok(None),
-                (Res::Unsat(a), Res::Unsat(b)) => self.verify_conflicts(challenge, a, b).await,
-                (Res::Sat, Res::Unsat(b_conflict)) => Ok(Some(Failure {
-                    seed: None,
-                    assumptions: challenge.to_vec(),
-                    mode: FailureMode::SatUnsat { b_conflict },
-                })),
-                (Res::Unsat(a_conflict), Res::Sat) => Ok(Some(Failure {
-                    seed: None,
-                    assumptions: challenge.to_vec(),
-                    mode: FailureMode::UnsatSat { a_conflict },
-                })),
+                (Res::Sat, Res::Sat) => Ok(Ok(true)),
+                (Res::Unsat(a), Res::Unsat(b)) => {
+                    if let Some(fail) = self.verify_conflicts(challenge, a, b).await? {
+                        Ok(Err(fail))
+                    } else {
+                        Ok(Ok(false))
+                    }
+                }
+                (Res::Sat, Res::Unsat(confl_b)) => Ok(Err(Failure::sat_unsat(challenge, confl_b))),
+                (Res::Unsat(confl_a), Res::Sat) => Ok(Err(Failure::unsat_sat(challenge, confl_a))),
             }
         }
 
@@ -939,12 +1005,6 @@ mod coordinator {
                 }
             }
 
-            let wrap_failure = |mode| Failure {
-                seed: None,
-                assumptions: challenge.to_vec(),
-                mode,
-            };
-
             let failure = if let Some(trusted) = args.trusted_solver {
                 print!(
                     concat_lines!(
@@ -961,14 +1021,15 @@ mod coordinator {
                 let res = trusted_solver
                     .run_challenge(verified_conflict.iter())
                     .await?;
-                bad_conflict(res, verified_conflict.into_vec())
-                    .map(|c| FailureMode::NoConflict {
-                        clauses: trusted.select::<fn(Clause) -> These<Clause, Clause>>(
+                bad_conflict(res, verified_conflict.into_vec()).map(|c| {
+                    Failure::no_conflict(
+                        challenge,
+                        trusted.select::<fn(Clause) -> These<Clause, Clause>>(
                             These::That,
                             These::This,
                         )(c),
-                    })
-                    .map(wrap_failure)
+                    )
+                })
             } else {
                 print!(concat_lines!(
                     /**/ "",
@@ -979,13 +1040,12 @@ mod coordinator {
                     self.solver_a.run_challenge(confl_b.iter()),
                     self.solver_b.run_challenge(confl_a.iter())
                 )
-                .merge_errors("Multiple errors occured.")?;
+                .merge_errors()?;
 
                 let failed_a = bad_conflict(res_b, confl_a.into_vec());
                 let failed_b = bad_conflict(res_a, confl_b.into_vec());
                 These::merge_these(failed_a, failed_b)
-                    .map(|clauses| FailureMode::NoConflict { clauses })
-                    .map(wrap_failure)
+                    .map(|bad_conflicts| Failure::no_conflict(challenge, bad_conflicts))
             };
 
             if failure.is_none() {
@@ -1000,6 +1060,98 @@ mod coordinator {
             }
 
             Ok(failure)
+        }
+
+        async fn search_once(
+            &mut self,
+            searcher: &mut impl AssumptionSearch,
+        ) -> Result<Option<Failure>> {
+            let challenge = searcher.next_challenge();
+            match self.run_challenge_impl(challenge.as_ref()).await? {
+                Ok(true) => {
+                    searcher.register_challenge_sat(challenge);
+                    Ok(None)
+                }
+                Ok(false) => {
+                    searcher.register_challenge_unsat(challenge);
+                    Ok(None)
+                }
+                Err(fail) => Ok(Some(fail)),
+            }
+        }
+
+        pub async fn run_search(
+            &mut self,
+            searcher: &mut impl AssumptionSearch,
+        ) -> Result<Failure> {
+            loop {
+                if let Some(fail) = self.search_once(searcher).await? {
+                    return Ok(fail);
+                }
+            }
+        }
+    }
+
+    pub trait AssumptionSearch {
+        type Challenge: AsRef<[Lit]>;
+
+        fn next_challenge(&mut self) -> Self::Challenge;
+        fn register_challenge_sat(&mut self, _challenge: Self::Challenge) {}
+        fn register_challenge_unsat(&mut self, _challenge: Self::Challenge) {}
+    }
+
+    pub struct RandomSearch {
+        rng: SmallRng,
+        size: u64,
+        size_dist: distributions::Uniform<u64>,
+    }
+
+    impl RandomSearch {
+        pub fn new(seed: Option<u64>, size: u64) -> Result<(Self, u64)> {
+            let seed = if let Some(seed) = seed {
+                seed
+            } else {
+                let mut bytes = [0; 8];
+                getrandom::getrandom(&mut bytes).wrap_err("failed to generate initial seed")?;
+                u64::from_ne_bytes(bytes)
+            };
+
+            // Overall we want to have clauses containing at most 2/3 of all possible variables. If
+            // the max clause size resolves to three or less we simply take the complete size.
+            let max_clause_size = size / 3 * 2;
+            let max_clause_size = if max_clause_size <= 3 {
+                size
+            } else {
+                max_clause_size
+            };
+            let random_search = RandomSearch {
+                size,
+                size_dist: distributions::Uniform::new_inclusive(0, max_clause_size),
+                rng: SmallRng::seed_from_u64(seed),
+            };
+
+            Ok((random_search, seed))
+        }
+    }
+
+    impl AssumptionSearch for RandomSearch {
+        type Challenge = Clause;
+
+        fn next_challenge(&mut self) -> Self::Challenge {
+            // Decide how big the clause should be.
+            let n = self.size_dist.sample(&mut self.rng);
+            // Draw `n` variables for the clause.
+            let vars = rand::seq::index::sample(&mut self.rng, self.size as usize, n as usize);
+            // Turn the variables into literals.
+            vars.into_iter()
+                .map(|v| {
+                    if self.rng.gen() {
+                        v as i64 + 1
+                    } else {
+                        -(v as i64 + 1)
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -1032,7 +1184,11 @@ mod util {
     pub trait MergeErrors: Sized {
         type Merged;
 
-        fn merge_errors<M: Display + Debug + Send + Sync + 'static>(
+        fn merge_errors(self) -> Result<Self::Merged> {
+            self.merge_errors_msg("Multiple errors occured.")
+        }
+
+        fn merge_errors_msg<M: Display + Debug + Send + Sync + 'static>(
             self,
             msg: M,
         ) -> Result<Self::Merged> {
