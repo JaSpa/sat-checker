@@ -109,11 +109,21 @@ async fn run(a: &mut Solver, b: &mut Solver) -> Result<()> {
     let size = coordinator.size().await?;
     let (mut searcher, seed) =
         RandomSearch::new(args.seed, size).wrap_err("failed to initialize random search")?;
-    let mut fail = coordinator.run_search(&mut searcher).await?;
-    fail.push_rerun(format!(
-        "use  --seed={seed}  to rerun the complete sequence"
-    ));
-    println!("{fail}");
+    let maybe_fail = coordinator
+        .run_search(&mut searcher, Some(args.stop_after).filter(|&n| n > 0))
+        .await?;
+    if let Some(mut fail) = maybe_fail {
+        fail.push_rerun(format!(
+            "use  --seed={seed}  to rerun the complete sequence"
+        ));
+        println!("{fail}");
+    } else {
+        println!(
+            "Search terminated after {} step{}",
+            args.stop_after,
+            if args.stop_after == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
@@ -175,6 +185,11 @@ mod cmd {
         /// different choices.
         #[arg(short, long, group = "entrypoint")]
         pub seed: Option<u64>,
+
+        /// When running a random search stop after <N> steps. Defaults to ‘0’ which is equivalent
+        /// to running indefinetly.
+        #[arg(short = 'n', long, value_name = "N", default_value_t = 0)]
+        pub stop_after: u64,
 
         /// Instead of performing a a random search, check a given set of comma or white-space
         /// separated assumptions. Can be given multiple times to check different sets of
@@ -1083,10 +1098,18 @@ mod coordinator {
         pub async fn run_search(
             &mut self,
             searcher: &mut impl AssumptionSearch,
-        ) -> Result<Failure> {
+            mut tries: Option<u64>,
+        ) -> Result<Option<Failure>> {
             loop {
                 if let Some(fail) = self.search_once(searcher).await? {
-                    return Ok(fail);
+                    return Ok(Some(fail));
+                }
+
+                if let Some(n) = tries {
+                    let Some(n_rem) = n.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    tries = Some(n_rem);
                 }
             }
         }
