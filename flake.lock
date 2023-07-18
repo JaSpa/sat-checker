@@ -78,11 +78,11 @@
     "minisat-mod-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1683826412,
-        "narHash": "sha256-ffoarYTR1bUl72bVwHw1mCFXB/jPnAhLeKorhBhWnPw=",
+        "lastModified": 1686840826,
+        "narHash": "sha256-ZAYK+Tels+Mj9h5JmWGzCZkja0YIpL+nAy8lLfCjl4E=",
         "owner": "JaSpa",
         "repo": "minisat",
-        "rev": "12362ab9203bfe156584a086e50edeca11cb5a50",
+        "rev": "f5abb5208da0f0a7aa22272ba86fb49f5b707f39",
         "type": "github"
       },
       "original": {
