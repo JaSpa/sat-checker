@@ -5,7 +5,7 @@ use futures_core::future::LocalBoxFuture;
 use solver::Solver;
 use util::MergeErrors;
 
-use crate::coordinator::RandomSearch;
+use crate::coordinator::{RandomSearch, RerunVariant};
 
 macro_rules! concat_lines {
     ($($ln:literal),+ $(,)?) => {
@@ -110,21 +110,37 @@ async fn run(a: &mut Solver, b: &mut Solver) -> Result<()> {
     let (mut searcher, seed) =
         RandomSearch::new(args.seed, size).wrap_err("failed to initialize random search")?;
     let maybe_fail = coordinator
-        .run_search(&mut searcher, Some(args.stop_after).filter(|&n| n > 0))
+        .run_search(&mut searcher, args.stop_after)
         .await?;
+
+    let n = coordinator.completed_challenges();
+    write_border("");
+    println!(
+        "Search terminated after {n} {}",
+        if n == 1 { "step" } else { "steps" }
+    );
+
     if let Some(mut fail) = maybe_fail {
-        fail.push_rerun(format!(
-            "use  --seed={seed}  to rerun the complete sequence"
-        ));
-        println!("{fail}");
-    } else {
-        println!(
-            "Search terminated after {} step{}",
-            args.stop_after,
-            if args.stop_after == 1 { "" } else { "s" }
-        );
+        fail.rerun_variants.push(RerunVariant {
+            name: "rerun-sequence",
+            description: "rerun sequence to point of failure",
+            arguments: vec![format!("--seed={seed}"), format!("-N={n}")],
+        });
+
+        write_border(" FAILED ");
+        println!("{}", fail.mode);
+        write_border("");
+
+        if let Err(e) = fail.write_replay(cmd::args()) {
+            return Err(e.wrap_err("fatal: failed to write replay information"));
+        }
     }
+
     Ok(())
+}
+
+fn write_border(title: &str) {
+    println!("{title:-^79}")
 }
 
 fn print_solver_exit(tag: Tag) -> impl Fn(ExitStatus) {
@@ -139,12 +155,7 @@ fn print_solver_exit(tag: Tag) -> impl Fn(ExitStatus) {
 }
 
 mod cmd {
-    use std::{
-        ffi::{OsStr, OsString},
-        mem::MaybeUninit,
-        path::PathBuf,
-        sync::Once,
-    };
+    use std::{ffi::OsStr, mem::MaybeUninit, path::PathBuf, sync::Once};
 
     use crate::{solver, Tag};
 
@@ -212,7 +223,7 @@ mod cmd {
         debug: bool,
 
         /// Arguments passed to the solver executables.
-        pub solver_args: Vec<OsString>,
+        pub solver_args: Vec<String>,
     }
 
     /// Returns a string slice with any balanced bracketing (and potentially separating ASCII
@@ -770,7 +781,12 @@ mod solver {
 }
 
 mod coordinator {
-    use std::fmt;
+    use std::{
+        fmt,
+        fs::File,
+        io::{BufWriter, ErrorKind},
+        path::{Path, PathBuf},
+    };
 
     use color_eyre::{eyre::eyre, eyre::WrapErr, Result};
     use rand::{
@@ -782,10 +798,17 @@ mod coordinator {
     use these::These;
 
     use crate::{
-        cmd,
+        cmd::{self, Args},
         solver::{Clause, ClauseRef, Lit, Res, Solver},
         util::{DigitCount, Joined, MergeErrors, MergeThese},
     };
+
+    #[derive(Debug)]
+    pub struct RerunVariant {
+        pub name: &'static str,
+        pub description: &'static str,
+        pub arguments: Vec<String>,
+    }
 
     /// Describes a detected failure.
     #[derive(Debug)]
@@ -794,8 +817,8 @@ mod coordinator {
         pub assumptions: Clause,
         /// Describes the failure that occured.
         pub mode: FailureMode,
-        /// Each entry is printed as a way to rerun the solver.
-        pub rerun_options: Vec<String>,
+        /// Describes different ways to rerun the solver.
+        pub rerun_variants: Vec<RerunVariant>,
     }
 
     /// Describes the kind of detected failure.
@@ -816,12 +839,45 @@ mod coordinator {
         NoConflict { clauses: These<Clause, Clause> },
     }
 
+    impl fmt::Display for FailureMode {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let args = cmd::args();
+            match self {
+                FailureMode::SatUnsat { b_conflict } => {
+                    writeln!(f)?;
+                    writeln!(f, "Solver {} reports   SAT", args.name_a)?;
+                    writeln!(f, "Solver {} reports UNSAT", args.name_b)?;
+                    writeln!(f, "  conflict clause: {}", b_conflict.joined())?;
+                }
+                FailureMode::UnsatSat { a_conflict } => {
+                    writeln!(f)?;
+                    writeln!(f, "Solver {} reports UNSAT", args.name_a)?;
+                    writeln!(f, "  conflict clause: {}", a_conflict.joined())?;
+                    writeln!(f, "Solver {} reports   SAT", args.name_b)?;
+                }
+                FailureMode::NoConflict { clauses } => {
+                    if let Some(a_confl) = clauses.as_ref().here() {
+                        writeln!(f)?;
+                        writeln!(f, "Bad conflict reported by solver {}", args.name_a)?;
+                        writeln!(f, "  conflict clause: {}", a_confl.joined())?;
+                    }
+                    if let Some(b_confl) = clauses.as_ref().there() {
+                        writeln!(f)?;
+                        writeln!(f, "Bad conflict reported by solver {}", args.name_b)?;
+                        writeln!(f, "  conflict clause: {}", b_confl.joined())?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl Failure {
         pub fn new(assumptions: impl Into<Clause>, mode: FailureMode) -> Self {
             Failure {
                 assumptions: assumptions.into(),
                 mode,
-                rerun_options: Vec::new(),
+                rerun_variants: Vec::new(),
             }
         }
 
@@ -837,8 +893,73 @@ mod coordinator {
             Self::new(assumptions, FailureMode::NoConflict { clauses: conflicts })
         }
 
-        pub fn push_rerun(&mut self, rerun: impl Into<String>) {
-            self.rerun_options.push(rerun.into())
+        /// Creates a randomly but user-friendly named directory.
+        fn create_result_dir() -> Result<String> {
+            let gen_word = || random_word::gen(random_word::Lang::En);
+            loop {
+                let name = [gen_word(), gen_word(), gen_word()].join("-");
+                match std::fs::create_dir(&name) {
+                    Ok(_) => break Ok(name),
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        }
+
+        fn write_replay_file(
+            path: impl AsRef<Path>,
+            args: &Args,
+            variant: &RerunVariant,
+        ) -> Result<()> {
+            use std::io::Write;
+
+            // Write to arguments to the assembled path.
+            let mut file = BufWriter::with_capacity(1024, File::create(path)?);
+
+            // Basic environment.
+            writeln!(file, "--solver-a={}", args.solver_a.display())?;
+            writeln!(file, "--solver-b={}", args.solver_b.display())?;
+            writeln!(file, "--name-a={}", args.name_a)?;
+            writeln!(file, "--name-b={}", args.name_b)?;
+            if let Some(trusted) = args.trusted_solver {
+                writeln!(file, "--trust={trusted}")?;
+            }
+
+            // Variant arguments.
+            for arg in &variant.arguments {
+                writeln!(file, "{arg}")?;
+            }
+
+            // Solver arguments
+            writeln!(file, "--")?;
+            for fwd_arg in &args.solver_args {
+                writeln!(file, "{fwd_arg}")?;
+            }
+
+            Ok(())
+        }
+
+        pub fn write_replay(&self, args: &Args) -> Result<()> {
+            // Create a directory which holds the result files.
+            let mut replay_file = PathBuf::from(Self::create_result_dir()?);
+
+            for variant in &self.rerun_variants {
+                // Push the variant's name acting as the file name.
+                replay_file.push(&variant.name);
+                replay_file.set_extension("txt");
+
+                // Write file.
+                Self::write_replay_file(&replay_file, args, variant)
+                    .wrap_err_with(|| format!("failed write to {}", replay_file.display()))?;
+
+                // Tell user about this file.
+                println!("{}\n   {}", replay_file.display(), variant.description);
+
+                // Clear the file name component in preparation for the next loop iteration.
+                replay_file.pop();
+            }
+
+            Ok(())
         }
     }
 
@@ -887,9 +1008,9 @@ mod coordinator {
                 write!(f, "{}", self.assumptions.joined_by(','))?;
             }
             writeln!(f, "  to rerun this test case")?;
-            for rerun in &self.rerun_options {
-                writeln!(f, "* {rerun}")?;
-            }
+            //          for rerun in &self.rerun_options {
+            //              writeln!(f, "* {rerun}")?;
+            //          }
 
             write_border(f, "")?;
             Ok(())
@@ -899,7 +1020,7 @@ mod coordinator {
     pub type OrderedClause = SortedSet<Lit>;
 
     pub struct Coordinator<'s> {
-        challenge_index: u32,
+        challenge_index: u64,
         solver_a: &'s mut Solver,
         solver_b: &'s mut Solver,
     }
@@ -911,6 +1032,10 @@ mod coordinator {
                 solver_a,
                 solver_b,
             }
+        }
+
+        pub fn completed_challenges(&self) -> u64 {
+            self.challenge_index
         }
 
         pub async fn size(&mut self) -> Result<u64> {
@@ -1091,27 +1216,29 @@ mod coordinator {
                     searcher.register_challenge_unsat(challenge);
                     Ok(None)
                 }
-                Err(fail) => Ok(Some(fail)),
+                Err(mut fail) => {
+                    fail.rerun_variants.push(RerunVariant {
+                        name: "rerun-single",
+                        description: "rerun failed set of assumptions",
+                        arguments: vec![format!("--assume={}", challenge.as_ref().joined_by(','))],
+                    });
+                    Ok(Some(fail))
+                }
             }
         }
 
         pub async fn run_search(
             &mut self,
             searcher: &mut impl AssumptionSearch,
-            mut tries: Option<u64>,
+            max_tries: u64,
         ) -> Result<Option<Failure>> {
-            loop {
+            self.challenge_index = 0;
+            while max_tries == 0 || self.challenge_index < max_tries {
                 if let Some(fail) = self.search_once(searcher).await? {
                     return Ok(Some(fail));
                 }
-
-                if let Some(n) = tries {
-                    let Some(n_rem) = n.checked_sub(1) else {
-                        return Ok(None);
-                    };
-                    tries = Some(n_rem);
-                }
             }
+            Ok(None)
         }
     }
 
