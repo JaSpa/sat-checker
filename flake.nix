@@ -8,6 +8,7 @@
     nixpkgs.follows = "nixpkgs";
   };
 
+  #inputs.minisat-mod-src.url = github:JaSpa/minisat/fix-assumption-inconsistencies;
   inputs.minisat-mod-src.url = github:JaSpa/minisat;
   inputs.minisat-mod-src.flake = false;
 
